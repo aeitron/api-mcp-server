@@ -12,9 +12,7 @@ import {
   AuthClaims,
   checkToolAuthorization,
   createDnsDeletionRequest,
-  issueDnsDeletionChallenge,
-  verifyAndConsumeDnsDeletionApproval,
-  verifyDnsDeletionChallenge
+  verifyAndConsumeDnsDeletionApproval
 } from '../auth.js';
 
 export function registerDnsTools(
@@ -278,7 +276,24 @@ export function registerDnsTools(
         };
       }
 
-      // 3. Challenge Guard: Reject if no approval token is provided (prevents LLM self-authorization)
+      // 3. Safety Confirmation Guard: confirm must be explicitly true before consuming approval token
+      if (args.confirm !== true) {
+        audit.logToolExecution('delete_dns_record', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, 'Confirmation rejected: confirm must be explicitly true');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `⚠️ SAFETY GUARD: Permanent deletion requires explicit confirmation. Please specify "confirm: true" along with a valid approval token.`
+            }
+          ]
+        };
+      }
+
+      // 4. Challenge Guard: Reject if no approval token is provided (prevents LLM self-authorization)
       if (!args.approvalToken) {
         const req = createDnsDeletionRequest(tenantId, actorId, args.domain, args.recordId);
         audit.logToolExecution('delete_dns_record', args, 0, false, {
@@ -309,7 +324,7 @@ export function registerDnsTools(
         };
       }
 
-      // 4. Verify & Atomically Consume Cryptographic Challenge Approval Token (Replay Protected)
+      // 5. Verify & Atomically Consume Cryptographic Challenge Approval Token (Replay Protected)
       const tokenVerification = verifyAndConsumeDnsDeletionApproval(args.approvalToken, tenantId, args.domain, args.recordId);
       if (!tokenVerification.valid) {
         audit.logToolExecution('delete_dns_record', args, 0, false, {
@@ -322,23 +337,6 @@ export function registerDnsTools(
             {
               type: 'text',
               text: `403 Forbidden: Invalid or expired deletion approval token: ${tokenVerification.error}`
-            }
-          ]
-        };
-      }
-
-      // 5. Explicit Confirmation Boolean Check
-      if (args.confirm !== true) {
-        audit.logToolExecution('delete_dns_record', args, 0, false, {
-          tenantId: authClaims?.tenantId,
-          actorId: authClaims?.actorId
-        }, 'Confirmation rejected: confirm must be explicitly true');
-        return {
-          isError: true,
-          content: [
-            {
-              type: 'text',
-              text: `⚠️ SAFETY GUARD: Valid approval token provided, but "confirm" argument must also be explicitly true to execute deletion.`
             }
           ]
         };

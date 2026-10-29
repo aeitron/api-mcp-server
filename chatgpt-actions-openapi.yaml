@@ -307,6 +307,7 @@ components:
             dns:read: View DNS zones and records
             dns:write: Add DNS records
             dns:write:delete: Delete DNS records (Destructive)
+            dns:delete:approve: Authorize human operator DNS deletions (Destructive)
             usage:read: View metered resource consumption
     ApiKeyAuth:
       type: apiKey

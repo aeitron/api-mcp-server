@@ -61,6 +61,21 @@ export function createMcpHttpServer(
     createdAt: number;
     lastActiveAt: number;
   }>();
+
+  // Session Capacity Guard with pending reservation counter to prevent async race conditions
+  let pendingSessionCreations = 0;
+  function reserveSessionSlot(): boolean {
+    const activeCount = streamableSessions.size + activeSessions.size + pendingSessionCreations;
+    if (activeCount >= config.maxActiveSessions) {
+      return false;
+    }
+    pendingSessionCreations += 1;
+    return true;
+  }
+  function releaseSessionSlot(): void {
+    pendingSessionCreations = Math.max(0, pendingSessionCreations - 1);
+  }
+
   const startTime = Date.now();
 
   const isHardened = config.environment === 'production' || config.environment === 'staging';
@@ -221,7 +236,8 @@ export function createMcpHttpServer(
     const auth = verifyAuthToken(rawToken, {
       isProduction: config.environment === 'production',
       allowSandbox: config.allowSandbox,
-      jwtSecret: config.jwtSecret
+      jwtSecret: config.jwtSecret,
+      requiredScopes: ['dns:delete:approve']
     });
 
     if (!auth.success) {
@@ -280,13 +296,14 @@ export function createMcpHttpServer(
     }
 
     // Privileged operator scope enforcement
-    const hasOperatorScope = auth.claims.scopes.includes('dns:write:delete') ||
+    const hasOperatorScope = auth.claims.scopes.includes('dns:delete:approve') ||
+      auth.claims.scopes.includes('dns:write:delete') ||
       auth.claims.scopes.includes('dns:write') ||
       auth.claims.scopes.includes('*');
     if (!hasOperatorScope) {
       return c.json({
         error: 'forbidden',
-        error_description: 'Access denied: Viewing pending DNS deletion requests requires operator scope "dns:write:delete" or "dns:write".'
+        error_description: 'Access denied: Viewing pending DNS deletion requests requires operator scope "dns:delete:approve", "dns:write:delete", or "dns:write".'
       }, 403);
     }
 
@@ -311,7 +328,8 @@ export function createMcpHttpServer(
     }
 
     // Privileged operator scope enforcement
-    const hasOperatorScope = auth.claims.scopes.includes('dns:write:delete') ||
+    const hasOperatorScope = auth.claims.scopes.includes('dns:delete:approve') ||
+      auth.claims.scopes.includes('dns:write:delete') ||
       auth.claims.scopes.includes('dns:write') ||
       auth.claims.scopes.includes('*');
     if (!hasOperatorScope) {
@@ -513,8 +531,8 @@ export function createMcpHttpServer(
           return;
         }
 
-        // Capacity Guard: Maximum active sessions limit
-        if (streamableSessions.size + activeSessions.size >= config.maxActiveSessions) {
+        // Capacity Guard: Maximum active sessions limit with reservation lock
+        if (!reserveSessionSlot()) {
           res.writeHead(503, {
             'Content-Type': 'application/problem+json',
             'Retry-After': '30'
@@ -528,37 +546,41 @@ export function createMcpHttpServer(
           return;
         }
 
-        // Fresh session initialization or stateless invocation
-        const sessionId = crypto.randomUUID();
-        const apiClient = new AeitronApiClient({
-          ...config,
-          defaultApiKey: auth.token
-        });
+        try {
+          // Fresh session initialization or stateless invocation
+          const sessionId = crypto.randomUUID();
+          const apiClient = new AeitronApiClient({
+            ...config,
+            defaultApiKey: auth.token
+          });
 
-        const serverInstance = createAeitronMcpServer({
-          config,
-          client: apiClient,
-          authClaims: auth.claims
-        });
+          const serverInstance = createAeitronMcpServer({
+            config,
+            client: apiClient,
+            authClaims: auth.claims
+          });
 
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => sessionId,
-          enableJsonResponse: true,
-          onsessionclosed: (closedId) => {
-            streamableSessions.delete(closedId);
-          }
-        });
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => sessionId,
+            enableJsonResponse: true,
+            onsessionclosed: (closedId) => {
+              streamableSessions.delete(closedId);
+            }
+          });
 
-        await serverInstance.server.connect(transport);
-        streamableSessions.set(sessionId, {
-          transport,
-          serverInstance,
-          claims: auth.claims,
-          createdAt: Date.now(),
-          lastActiveAt: Date.now()
-        });
+          await serverInstance.server.connect(transport);
+          streamableSessions.set(sessionId, {
+            transport,
+            serverInstance,
+            claims: auth.claims,
+            createdAt: Date.now(),
+            lastActiveAt: Date.now()
+          });
 
-        await transport.handleRequest(req, res);
+          await transport.handleRequest(req, res);
+        } finally {
+          releaseSessionSlot();
+        }
         return;
       }
 
@@ -601,55 +623,74 @@ export function createMcpHttpServer(
         return;
       }
 
-      const toolContext: ToolContext = {
-        token: auth.token,
-        tenantId: auth.claims.tenantId,
-        actorId: auth.claims.actorId
-      };
-
-      const apiClient = new AeitronApiClient({
-        ...config,
-        defaultApiKey: auth.token
-      });
-
-      const serverInstance = createAeitronMcpServer({
-        config,
-        client: apiClient,
-        authClaims: auth.claims
-      });
-
-      const baseMessagesPath = pathname === '/sse' ? '/messages' : '/mcp/messages';
-      const messagesPath = wasInQuery && rawToken ? `${baseMessagesPath}?token=${encodeURIComponent(rawToken)}` : baseMessagesPath;
-      const transport = new SSEServerTransport(messagesPath, res);
-
-      const session: ActiveSession = {
-        sessionId: transport.sessionId,
-        transport,
-        serverInstance,
-        context: toolContext,
-        createdAt: new Date(),
-        lastActiveAt: Date.now()
-      };
-
-      activeSessions.set(transport.sessionId, session);
-
-      res.on('close', async () => {
-        activeSessions.delete(transport.sessionId);
-        try {
-          await serverInstance.server.close();
-        } catch {
-          // ignore close errors on connection tear-down
-        }
-      });
+      // Capacity Guard: Maximum active sessions limit on SSE Handshake with reservation lock
+      if (!reserveSessionSlot()) {
+        res.writeHead(503, {
+          'Content-Type': 'application/problem+json',
+          'Retry-After': '30'
+        });
+        res.end(JSON.stringify({
+          type: 'https://aeitron.com/errors/service-unavailable',
+          title: 'Service Unavailable',
+          status: 503,
+          detail: `Maximum active sessions capacity (${config.maxActiveSessions}) reached. Please retry later.`
+        }));
+        return;
+      }
 
       try {
-        await serverInstance.server.connect(transport);
-      } catch (err: unknown) {
-        activeSessions.delete(transport.sessionId);
-        if (!res.headersSent) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `Failed to initialize SSE session: ${String(err)}` }));
+        const toolContext: ToolContext = {
+          token: auth.token,
+          tenantId: auth.claims.tenantId,
+          actorId: auth.claims.actorId
+        };
+
+        const apiClient = new AeitronApiClient({
+          ...config,
+          defaultApiKey: auth.token
+        });
+
+        const serverInstance = createAeitronMcpServer({
+          config,
+          client: apiClient,
+          authClaims: auth.claims
+        });
+
+        const baseMessagesPath = pathname === '/sse' ? '/messages' : '/mcp/messages';
+        const messagesPath = wasInQuery && rawToken ? `${baseMessagesPath}?token=${encodeURIComponent(rawToken)}` : baseMessagesPath;
+        const transport = new SSEServerTransport(messagesPath, res);
+
+        const session: ActiveSession = {
+          sessionId: transport.sessionId,
+          transport,
+          serverInstance,
+          context: toolContext,
+          createdAt: new Date(),
+          lastActiveAt: Date.now()
+        };
+
+        activeSessions.set(transport.sessionId, session);
+
+        res.on('close', async () => {
+          activeSessions.delete(transport.sessionId);
+          try {
+            await serverInstance.server.close();
+          } catch {
+            // ignore close errors on connection tear-down
+          }
+        });
+
+        try {
+          await serverInstance.server.connect(transport);
+        } catch (err: unknown) {
+          activeSessions.delete(transport.sessionId);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Failed to initialize SSE session: ${String(err)}` }));
+          }
         }
+      } finally {
+        releaseSessionSlot();
       }
       return;
     }

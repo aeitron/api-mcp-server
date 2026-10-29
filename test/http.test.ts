@@ -355,11 +355,11 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     });
     assert.equal(unprivRes.status, 403);
 
-    // Operator with valid dns:write:delete scope approves deletion request -> 200 OK with approvalToken
+    // Operator with valid dns:delete:approve scope approves deletion request -> 200 OK with approvalToken
     const operatorToken = createSignedTestJwt({
       sub: 'usr_authorized_operator',
       tenant_id: 'tenant_customerAcme',
-      scopes: ['dns:write:delete']
+      scopes: ['dns:delete:approve']
     });
 
     const approveRes = await fetch(`${baseUrl}/v1/dns/approve-deletion`, {
@@ -429,6 +429,19 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
       const res2Body = await res2.json() as { status: number; title: string };
       assert.equal(res2Body.status, 503);
       assert.equal(res2Body.title, 'Service Unavailable');
+
+      // Third session via SSE handshake must ALSO be rejected with 503 Service Unavailable
+      const res3 = await fetch(`${limitedBaseUrl}/mcp/sse`, {
+        method: 'GET',
+        headers: {
+          'Accept': 'text/event-stream',
+          'Authorization': 'Bearer atk_sandbox_session_3'
+        }
+      });
+      assert.equal(res3.status, 503);
+      const res3Body = await res3.json() as { status: number; title: string };
+      assert.equal(res3Body.status, 503);
+      assert.equal(res3Body.title, 'Service Unavailable');
     } finally {
       await limitedServer.close();
     }

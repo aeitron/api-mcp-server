@@ -75,9 +75,9 @@ export const ACTIVE_KID = process.env.AEITRON_JWT_KID || 'aeitron-mcp-rsa-2026-v
 const AUTHORITATIVE_KEYS = new Map<string, RegisteredKey>();
 const OAUTH_CLIENTS = new Map<string, OAuthClient>();
 
-function isProduction(): boolean {
+export function isHardenedEnvironment(): boolean {
   const env = (process.env.AEITRON_ENV || process.env.NODE_ENV || '').trim().toLowerCase();
-  return env === 'production' || env === 'prod';
+  return env === 'production' || env === 'prod' || env === 'staging' || env === 'stage';
 }
 
 function getStorageDir(): string {
@@ -96,8 +96,8 @@ function ensureStorageDir(): string {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
   } catch (err) {
-    if (isProduction()) {
-      throw new Error(`CRITICAL: Failed to initialize persistent storage directory '${dir}' in production: ${err instanceof Error ? err.message : String(err)}`);
+    if (isHardenedEnvironment()) {
+      throw new Error(`CRITICAL: Failed to initialize persistent storage directory '${dir}' in hardened environment: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return dir;
@@ -199,7 +199,15 @@ export function verifyRsaKeyPairMatch(privateKeyPem: string, publicKeyPem: strin
 }
 
 // Asymmetric Key Pair for RFC 7517 compliant JWKS public key distribution and RS256 signing
-function loadOrGenerateRsaKeyPair(): RsaKeyPair {
+export function loadOrGenerateRsaKeyPair(): RsaKeyPair {
+  // Guard: Configured RSA key file must exist in hardened environments
+  const configuredKeyFile = process.env.AEITRON_RSA_KEY_FILE || process.env.AEITRON_JWT_KEY_FILE;
+  if (configuredKeyFile && isHardenedEnvironment()) {
+    if (!fs.existsSync(configuredKeyFile)) {
+      throw new Error(`CRITICAL: Configured RSA key file does not exist: ${configuredKeyFile}`);
+    }
+  }
+
   // 1. Direct environment variable support (standard 12-factor / KMS / secret manager)
   const envPrivate = process.env.AEITRON_RSA_PRIVATE_KEY || process.env.AEITRON_JWT_PRIVATE_KEY;
   const envPublic = process.env.AEITRON_RSA_PUBLIC_KEY || process.env.AEITRON_JWT_PUBLIC_KEY;
@@ -207,7 +215,7 @@ function loadOrGenerateRsaKeyPair(): RsaKeyPair {
   if (envPrivate) {
     if (envPublic) {
       if (!verifyRsaKeyPairMatch(envPrivate, envPublic)) {
-        if (isProduction()) {
+        if (isHardenedEnvironment()) {
           throw new Error('CRITICAL CONFIGURATION ERROR: Supplied AEITRON_RSA_PUBLIC_KEY does not correspond to AEITRON_RSA_PRIVATE_KEY.');
         }
         process.stderr.write('[aeitron-mcp][WARN] AEITRON_RSA_PUBLIC_KEY does not correspond to AEITRON_RSA_PRIVATE_KEY. Deriving public key from private key.\n');
@@ -228,8 +236,8 @@ function loadOrGenerateRsaKeyPair(): RsaKeyPair {
         const derivedPub = crypto.createPublicKey(privKey).export({ type: 'spki', format: 'pem' }) as string;
         return { privateKey: envPrivate, publicKey: derivedPub };
       } catch (err) {
-        if (isProduction()) {
-          throw new Error(`CRITICAL: Malformed AEITRON_RSA_PRIVATE_KEY in production: ${String(err)}`);
+        if (isHardenedEnvironment()) {
+          throw new Error(`CRITICAL: Malformed AEITRON_RSA_PRIVATE_KEY in hardened environment: ${String(err)}`);
         }
       }
     }
@@ -237,22 +245,28 @@ function loadOrGenerateRsaKeyPair(): RsaKeyPair {
 
   // 2. Persistent Key File from AEITRON_RSA_KEY_FILE / AEITRON_JWT_KEY_FILE
   const keyFilePath = process.env.AEITRON_RSA_KEY_FILE || process.env.AEITRON_JWT_KEY_FILE;
-  if (keyFilePath && fs.existsSync(keyFilePath)) {
-    try {
-      const fileContent = fs.readFileSync(keyFilePath, 'utf-8');
-      const parsed = JSON.parse(fileContent);
-      if (parsed.privateKey && parsed.publicKey) {
-        if (!verifyRsaKeyPairMatch(parsed.privateKey, parsed.publicKey)) {
-          if (isProduction()) {
-            throw new Error(`CRITICAL CONFIGURATION ERROR: Key pair in '${keyFilePath}' does not match.`);
-          }
-        } else {
-          return { privateKey: parsed.privateKey, publicKey: parsed.publicKey };
-        }
+  if (keyFilePath) {
+    if (!fs.existsSync(keyFilePath)) {
+      if (isHardenedEnvironment()) {
+        throw new Error(`CRITICAL CONFIGURATION ERROR: Configured RSA key file '${keyFilePath}' does not exist.`);
       }
-    } catch (err) {
-      if (isProduction()) {
-        throw new Error(`CRITICAL: Failed to load RSA key file '${keyFilePath}' in production: ${String(err)}`);
+    } else {
+      try {
+        const fileContent = fs.readFileSync(keyFilePath, 'utf-8');
+        const parsed = JSON.parse(fileContent);
+        if (parsed.privateKey && parsed.publicKey) {
+          if (!verifyRsaKeyPairMatch(parsed.privateKey, parsed.publicKey)) {
+            if (isHardenedEnvironment()) {
+              throw new Error(`CRITICAL CONFIGURATION ERROR: Key pair in '${keyFilePath}' does not match.`);
+            }
+          } else {
+            return { privateKey: parsed.privateKey, publicKey: parsed.publicKey };
+          }
+        }
+      } catch (err) {
+        if (isHardenedEnvironment()) {
+          throw new Error(`CRITICAL: Failed to load RSA key file '${keyFilePath}' in hardened environment: ${String(err)}`);
+        }
       }
     }
   }
@@ -291,8 +305,8 @@ function loadOrGenerateRsaKeyPair(): RsaKeyPair {
     );
     fs.renameSync(tempFile, cachedKeyFile);
   } catch (err) {
-    if (isProduction()) {
-      throw new Error(`CRITICAL: Failed to persist generated RSA key pair to '${cachedKeyFile}' in production: ${err instanceof Error ? err.message : String(err)}`);
+    if (isHardenedEnvironment()) {
+      throw new Error(`CRITICAL: Failed to persist generated RSA key pair to '${cachedKeyFile}' in hardened environment: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -367,19 +381,58 @@ export interface PendingDeletionRequest {
 const PENDING_DELETION_REQUESTS = new Map<string, PendingDeletionRequest>();
 const CONSUMED_APPROVAL_TOKENS = new Set<string>();
 
-function getDnsStateFiles(): { reqFile: string; consumedFile: string } {
+interface DnsStatePayload {
+  version: 1;
+  requests: PendingDeletionRequest[];
+  consumedTokenHashes: string[];
+}
+
+function getDnsStateFilePath(): string {
   const dir = ensureStorageDir();
-  return {
-    reqFile: path.join(dir, 'dns-deletion-requests.json'),
-    consumedFile: path.join(dir, 'dns-consumed-tokens.json')
-  };
+  return path.join(dir, 'dns-deletion-state.json');
 }
 
 function loadDnsStateFromDisk(): void {
-  const { reqFile, consumedFile } = getDnsStateFiles();
-  try {
-    if (fs.existsSync(reqFile)) {
-      const data = JSON.parse(fs.readFileSync(reqFile, 'utf-8'));
+  const dir = ensureStorageDir();
+  const stateFile = getDnsStateFilePath();
+  const legacyReqFile = path.join(dir, 'dns-deletion-requests.json');
+  const legacyConsumedFile = path.join(dir, 'dns-consumed-tokens.json');
+
+  // Multi-process hygiene: Clear in-memory collections before loading fresh authoritative state
+  PENDING_DELETION_REQUESTS.clear();
+  CONSUMED_APPROVAL_TOKENS.clear();
+
+  if (fs.existsSync(stateFile)) {
+    try {
+      const content = fs.readFileSync(stateFile, 'utf-8');
+      const data: DnsStatePayload = JSON.parse(content);
+      const now = Date.now();
+      if (Array.isArray(data.requests)) {
+        for (const item of data.requests) {
+          if (item.requestId && item.expiresAt > now && !item.consumed) {
+            PENDING_DELETION_REQUESTS.set(item.requestId, item);
+          }
+        }
+      }
+      if (Array.isArray(data.consumedTokenHashes)) {
+        for (const hash of data.consumedTokenHashes) {
+          if (typeof hash === 'string') {
+            CONSUMED_APPROVAL_TOKENS.add(hash);
+          }
+        }
+      }
+      return;
+    } catch (err) {
+      if (isHardenedEnvironment()) {
+        throw new Error(`CRITICAL: Unable to read security state file '${stateFile}': ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  // Backward compatibility with legacy separate files if unified state file is not yet initialized
+  if (fs.existsSync(legacyReqFile)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(legacyReqFile, 'utf-8'));
       if (Array.isArray(data)) {
         const now = Date.now();
         for (const item of data) {
@@ -388,14 +441,16 @@ function loadDnsStateFromDisk(): void {
           }
         }
       }
+    } catch (err) {
+      if (isHardenedEnvironment()) {
+        throw new Error(`CRITICAL: Unable to read security state file '${legacyReqFile}': ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
-  } catch {
-    // Ignore read errors
   }
 
-  try {
-    if (fs.existsSync(consumedFile)) {
-      const data = JSON.parse(fs.readFileSync(consumedFile, 'utf-8'));
+  if (fs.existsSync(legacyConsumedFile)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(legacyConsumedFile, 'utf-8'));
       if (Array.isArray(data)) {
         for (const hash of data) {
           if (typeof hash === 'string') {
@@ -403,32 +458,28 @@ function loadDnsStateFromDisk(): void {
           }
         }
       }
+    } catch (err) {
+      if (isHardenedEnvironment()) {
+        throw new Error(`CRITICAL: Unable to read security state file '${legacyConsumedFile}': ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
-  } catch {
-    // Ignore read errors
   }
 }
 
 function saveDnsStateToDisk(): void {
-  const { reqFile, consumedFile } = getDnsStateFiles();
+  const stateFile = getDnsStateFilePath();
   try {
-    const reqList = Array.from(PENDING_DELETION_REQUESTS.values());
-    const tempReqFile = `${reqFile}.tmp.${Date.now()}`;
-    fs.writeFileSync(tempReqFile, JSON.stringify(reqList, null, 2), { encoding: 'utf-8', mode: 0o600 });
-    fs.renameSync(tempReqFile, reqFile);
+    const payload: DnsStatePayload = {
+      version: 1,
+      requests: Array.from(PENDING_DELETION_REQUESTS.values()),
+      consumedTokenHashes: Array.from(CONSUMED_APPROVAL_TOKENS)
+    };
+    const tempStateFile = `${stateFile}.tmp.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+    fs.writeFileSync(tempStateFile, JSON.stringify(payload, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(tempStateFile, stateFile);
   } catch (err) {
-    if (isProduction()) {
-      throw new Error(`CRITICAL: Failed to persist DNS deletion requests to '${reqFile}' in production: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-  try {
-    const consumedList = Array.from(CONSUMED_APPROVAL_TOKENS);
-    const tempConsumedFile = `${consumedFile}.tmp.${Date.now()}`;
-    fs.writeFileSync(tempConsumedFile, JSON.stringify(consumedList, null, 2), { encoding: 'utf-8', mode: 0o600 });
-    fs.renameSync(tempConsumedFile, consumedFile);
-  } catch (err) {
-    if (isProduction()) {
-      throw new Error(`CRITICAL: Failed to persist consumed approval tokens to '${consumedFile}' in production: ${err instanceof Error ? err.message : String(err)}`);
+    if (isHardenedEnvironment()) {
+      throw new Error(`CRITICAL: Failed to persist unified DNS deletion state to '${stateFile}' in hardened environment: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }
@@ -469,9 +520,8 @@ export function clearTestRegistries(): void {
   PENDING_DELETION_REQUESTS.clear();
   CONSUMED_APPROVAL_TOKENS.clear();
   try {
-    const { reqFile, consumedFile } = getDnsStateFiles();
-    if (fs.existsSync(reqFile)) fs.unlinkSync(reqFile);
-    if (fs.existsSync(consumedFile)) fs.unlinkSync(consumedFile);
+    const stateFile = getDnsStateFilePath();
+    if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile);
   } catch {
     // Ignore cleanup errors in tests
   }
@@ -993,6 +1043,12 @@ export function createDnsDeletionRequest(
 /**
  * Authorizes a pending deletion request by a verified human operator and issues a single-use token.
  */
+export const DNS_APPROVAL_SCOPE = 'dns:delete:approve';
+
+/**
+ * Authorizes a pending deletion request by a verified human operator and issues a single-use token.
+ * Enforces independent dual-control: Request creators are strictly prohibited from approving their own requests.
+ */
 export function authorizeDnsDeletionRequest(
   operatorClaims: AuthClaims,
   requestId: string,
@@ -1009,11 +1065,12 @@ export function authorizeDnsDeletionRequest(
   error: string;
   status: number;
 } {
-  if (!operatorClaims.scopes.includes('dns:write:delete') && !operatorClaims.scopes.includes('*')) {
+  // 1. Mandatory dedicated operator scope check (Wildcards & standard write scopes strictly disallowed)
+  if (!operatorClaims.scopes.includes(DNS_APPROVAL_SCOPE)) {
     return {
       success: false,
       status: 403,
-      error: 'Operator lacks "dns:write:delete" permission scope required to authorize deletion.'
+      error: `Operator lacks mandatory "${DNS_APPROVAL_SCOPE}" permission scope required to authorize deletion.`
     };
   }
 
@@ -1022,6 +1079,17 @@ export function authorizeDnsDeletionRequest(
   if (!req) {
     return { success: false, status: 404, error: 'Pending deletion request not found or expired.' };
   }
+
+  // 2. Strict Independent Human Approval Guard: Creator cannot self-approve
+  if (operatorClaims.actorId === req.actorId) {
+    return {
+      success: false,
+      status: 403,
+      error: 'Security Policy Violation: Request creators cannot approve their own DNS deletion requests. Independent human operator authorization required.'
+    };
+  }
+
+  // 3. Request state checks (unexpired, not consumed, not already authorized)
   if (Date.now() > req.expiresAt) {
     PENDING_DELETION_REQUESTS.delete(requestId);
     saveDnsStateToDisk();
@@ -1030,6 +1098,11 @@ export function authorizeDnsDeletionRequest(
   if (req.consumed) {
     return { success: false, status: 410, error: 'Pending deletion request has already been executed/consumed.' };
   }
+  if (req.authorized) {
+    return { success: false, status: 410, error: 'Pending deletion request has already been authorized.' };
+  }
+
+  // 4. Tenant isolation check
   if (operatorClaims.tenantId !== 'anonymous' && req.tenantId !== operatorClaims.tenantId) {
     return { success: false, status: 403, error: 'Operator tenant does not match deletion request tenant.' };
   }
@@ -1092,20 +1165,23 @@ export function createAuthorizedDnsDeletionToken(
   };
 }
 
-// Backwards-compatible alias for existing tests: registers a pending deletion request and authorizes it
+// Strictly for test suites to issue challenge tokens in non-hardened test environments
 export function issueDnsDeletionChallenge(
   tenantId: string,
   domain: string,
   recordId: string,
   secret?: string
 ): { token: string; expiresAt: number; requestId: string } {
-  const req = createDnsDeletionRequest(tenantId, 'operator_test_runner', domain, recordId);
+  if (isHardenedEnvironment()) {
+    throw new Error('SECURITY VIOLATION: issueDnsDeletionChallenge is strictly prohibited in hardened environments.');
+  }
+  const req = createDnsDeletionRequest(tenantId, 'usr_requester_client', domain, recordId);
   const authorized = authorizeDnsDeletionRequest(
     {
-      actorId: 'operator_test_runner',
+      actorId: 'usr_independent_human_operator',
       tenantId,
       tier: 'enterprise',
-      scopes: ['dns:write:delete'],
+      scopes: [DNS_APPROVAL_SCOPE],
       livemode: false
     },
     req.requestId,
@@ -1361,6 +1437,7 @@ export function getOAuthDiscoveryMetadata(publicBaseUrl: string): Record<string,
       'dns:read',
       'dns:write',
       'dns:write:delete',
+      'dns:delete:approve',
       'usage:read'
     ],
     response_types_supported: ['token'],

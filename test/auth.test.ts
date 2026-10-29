@@ -20,6 +20,7 @@ import {
   createDnsDeletionRequest,
   authorizeDnsDeletionRequest,
   createAuthorizedDnsDeletionToken,
+  loadOrGenerateRsaKeyPair,
   ACTIVE_KID
 } from '../src/auth.js';
 
@@ -511,7 +512,7 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
       actorId: 'usr_operator',
       tenantId: 'tenant_acme',
       tier: 'enterprise',
-      scopes: ['dns:write:delete'],
+      scopes: ['dns:delete:approve'],
       livemode: false
     }, req.requestId);
     assert.equal(authRes.success, true);
@@ -535,5 +536,78 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     const res = verifyDnsDeletionChallenge(differentToken, 'tenant_acme', 'aeitron.com', 'rec_mismatch_88');
     assert.equal(res.valid, false);
     assert.ok(res.error?.includes('does not match authorized token'));
+  });
+
+  it('DNS deletion approval hardening: strictly rejects creator self-approval', () => {
+    const req = createDnsDeletionRequest('tenant_acme', 'usr_creator_42', 'aeitron.com', 'rec_self_appr');
+    const authRes = authorizeDnsDeletionRequest({
+      actorId: 'usr_creator_42', // Same actor as requester
+      tenantId: 'tenant_acme',
+      tier: 'enterprise',
+      scopes: ['dns:delete:approve'],
+      livemode: false
+    }, req.requestId);
+    assert.equal(authRes.success, false);
+    assert.equal(authRes.status, 403);
+    assert.ok(authRes.error.includes('cannot approve their own DNS deletion requests'));
+  });
+
+  it('DNS deletion approval hardening: strictly rejects approval if operator lacks dns:delete:approve scope', () => {
+    const req = createDnsDeletionRequest('tenant_acme', 'usr_requester', 'aeitron.com', 'rec_scope_test');
+    const authRes = authorizeDnsDeletionRequest({
+      actorId: 'usr_operator_diff',
+      tenantId: 'tenant_acme',
+      tier: 'enterprise',
+      scopes: ['dns:write:delete'], // Only dns:write:delete, missing dns:delete:approve
+      livemode: false
+    }, req.requestId);
+    assert.equal(authRes.success, false);
+    assert.equal(authRes.status, 403);
+    assert.ok(authRes.error.includes('dns:delete:approve'));
+  });
+
+  it('DNS deletion approval hardening: strictly rejects approval across different tenants', () => {
+    const req = createDnsDeletionRequest('tenant_acme', 'usr_requester', 'aeitron.com', 'rec_cross_tenant');
+    const authRes = authorizeDnsDeletionRequest({
+      actorId: 'usr_operator_other',
+      tenantId: 'tenant_evil_corp',
+      tier: 'enterprise',
+      scopes: ['dns:delete:approve'],
+      livemode: false
+    }, req.requestId);
+    assert.equal(authRes.success, false);
+    assert.equal(authRes.status, 403);
+    assert.ok(authRes.error.includes('tenant does not match'));
+  });
+
+  it('issueDnsDeletionChallenge: strictly prohibited in hardened environments', () => {
+    const prevEnv = process.env.AEITRON_ENV;
+    try {
+      process.env.AEITRON_ENV = 'production';
+      assert.throws(() => {
+        issueDnsDeletionChallenge('tenant_acme', 'aeitron.com', 'rec_prod_1');
+      }, /SECURITY VIOLATION.*hardened/);
+    } finally {
+      process.env.AEITRON_ENV = prevEnv;
+    }
+  });
+
+  it('loadOrGenerateRsaKeyPair: strictly throws when configured RSA key file does not exist in hardened environment', () => {
+    const prevEnv = process.env.AEITRON_ENV;
+    const prevKeyFile = process.env.AEITRON_RSA_KEY_FILE;
+    try {
+      process.env.AEITRON_ENV = 'production';
+      process.env.AEITRON_RSA_KEY_FILE = 'C:\\nonexistent\\path\\to\\rsa_private.json';
+      assert.throws(() => {
+        loadOrGenerateRsaKeyPair();
+      }, /CRITICAL.*does not exist/);
+    } finally {
+      process.env.AEITRON_ENV = prevEnv;
+      if (prevKeyFile !== undefined) {
+        process.env.AEITRON_RSA_KEY_FILE = prevKeyFile;
+      } else {
+        delete process.env.AEITRON_RSA_KEY_FILE;
+      }
+    }
   });
 });

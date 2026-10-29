@@ -91,7 +91,7 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
       isProduction: config.environment === 'production',
       allowSandbox: config.allowSandbox,
       jwtSecret: config.jwtSecret,
-      requiredScopes: ['dns:write:delete']
+      requiredScopes: ['dns:delete:approve']
     });
 
     if (!authResult.success) {
@@ -104,7 +104,7 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
       actorId: 'usr_operator_cli_dev',
       tenantId: 'anonymous', // allows approving any local dev tenant request
       tier: 'enterprise',
-      scopes: ['*'],
+      scopes: ['dns:delete:approve'],
       livemode: false
     };
   } else {
@@ -112,7 +112,7 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
     return { success: false, error: 'Operator authentication token required.' };
   }
 
-  // 1. If HTTP server URL is provided, attempt HTTP approval first
+  // 1. If HTTP server URL is provided, attempt HTTP approval exclusively (no confusing local fallback)
   if (parsed.url) {
     try {
       const targetUrl = `${parsed.url.replace(/\/+$/, '')}/v1/dns/approve-deletion`;
@@ -134,7 +134,9 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
       printApprovalSuccess(data as { requestId: string; domain: string; recordId: string; approvalToken: string; expiresAt: number }, operatorClaims);
       return { success: true, token: String(data.approvalToken) };
     } catch (err) {
-      process.stderr.write(`[aeitron-mcp] Warning: Could not reach HTTP server at ${parsed.url}, falling back to local store: ${String(err)}\n`);
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[aeitron-mcp] ERROR: Remote approval server at ${parsed.url} unavailable; refusing local fallback. ${message}\n`);
+      return { success: false, error: 'Remote approval failed. Check connectivity and retry against the same server.' };
     }
   }
 

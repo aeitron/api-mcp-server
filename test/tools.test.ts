@@ -314,7 +314,7 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
         actorId: 'usr_human_operator_42',
         tenantId: 'tenant_customerAcme',
         tier: 'enterprise',
-        scopes: ['dns:write:delete'],
+        scopes: ['dns:delete:approve'],
         livemode: true
       },
       requestId
@@ -345,7 +345,7 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
         actorId: 'usr_human_operator_42',
         tenantId: 'tenant_customerAcme',
         tier: 'enterprise',
-        scopes: ['dns:write:delete'],
+        scopes: ['dns:delete:approve'],
         livemode: true
       },
       requestId
@@ -370,11 +370,11 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     assert.ok(match, 'Must contain del_req_ request ID');
     const requestId = match[0];
 
-    // 2. Human operator runs CLI approval with operator token containing dns:write:delete
+    // 2. Human operator runs CLI approval with operator token containing dns:delete:approve
     const operatorToken = createSignedTestJwt({
       sub: 'usr_operator_cli_admin',
       tenant_id: 'tenant_customerAcme',
-      scopes: ['dns:write:delete']
+      scopes: ['dns:delete:approve']
     });
 
     const cliResult = await handleDnsApproveDeletion({
@@ -397,6 +397,57 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     });
 
     assert.equal(executionResult.isError, undefined);
+  });
+
+  it('12d. delete_dns_record: preserves approvalToken when confirm is false or omitted', async () => {
+    const challenge = issueDnsDeletionChallenge('tenant_customerAcme', 'aeitron.com', 'rec_dns_cname_006');
+
+    // 1. Call with valid token but confirm: false -> fails but token is NOT consumed
+    const unconfirmedResult = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_006',
+        confirm: false,
+        approvalToken: challenge.token
+      }
+    });
+
+    assert.equal(unconfirmedResult.isError, true);
+    const unconfirmedText = (unconfirmedResult.content as Array<{ text: string }>)[0].text;
+    assert.ok(unconfirmedText.includes('SAFETY GUARD'));
+
+    // 2. Call again with confirm: true using the SAME token -> succeeds!
+    const confirmedResult = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_006',
+        confirm: true,
+        approvalToken: challenge.token
+      }
+    });
+
+    assert.equal(confirmedResult.isError, undefined);
+    const confirmedText = (confirmedResult.content as Array<{ text: string }>)[0].text;
+    assert.ok(confirmedText.includes('DNS Record Deleted Successfully'));
+  });
+
+  it('12e. CLI Operator Approval: refuses local fallback when --url is specified and fails', async () => {
+    const operatorToken = createSignedTestJwt({
+      sub: 'usr_operator_cli_admin',
+      tenant_id: 'tenant_customerAcme',
+      scopes: ['dns:delete:approve']
+    });
+
+    const cliResult = await handleDnsApproveDeletion({
+      requestId: 'del_req_mock_fail_test',
+      token: operatorToken,
+      url: 'http://127.0.0.1:59999' // Non-existent remote server
+    });
+
+    assert.equal(cliResult.success, false);
+    assert.ok(cliResult.error?.includes('Remote approval failed'));
   });
 
   it('13. delete_dns_record: rejects invalid or forged approvalToken with 403 Forbidden', async () => {
