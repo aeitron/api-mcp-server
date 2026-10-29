@@ -400,12 +400,16 @@ export class AeitronApiClient {
    * Deletes a DNS record from the domain zone
    */
   public async deleteDnsRecord(
-    params: { domain: string; recordId: string },
+    params: { domain: string; recordId: string; idempotencyKey?: string },
     context?: ToolContext
   ): Promise<{ success: boolean; message: string; recordId: string }> {
+    const headers: Record<string, string> = {};
+    if (params.idempotencyKey) {
+      headers['Idempotency-Key'] = params.idempotencyKey;
+    }
     return this.request<{ success: boolean; message: string; recordId: string }>(
       `/v1/domains/${encodeURIComponent(params.domain)}/records/${encodeURIComponent(params.recordId)}`,
-      { method: 'DELETE' },
+      { method: 'DELETE', headers },
       context,
       () => ({
         success: true,

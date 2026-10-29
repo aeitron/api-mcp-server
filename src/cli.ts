@@ -7,7 +7,7 @@
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createAeitronMcpServer } from './server.js';
-import { verifyAuthToken, AuthClaims, authorizeDnsDeletionRequest } from './auth.js';
+import { verifyAuthToken, AuthClaims, authorizeDnsDeletionRequest, getPendingDnsDeletionRequest } from './auth.js';
 import { getConfig } from './config.js';
 
 interface ParsedCliArgs {
@@ -84,36 +84,14 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
   }
 
   const rawToken = parsed.token || process.env.AEITRON_OPERATOR_TOKEN || process.env.AEITRON_API_KEY || process.env.AEITRON_TOKEN;
-  let operatorClaims: AuthClaims;
-
-  if (rawToken) {
-    const authResult = verifyAuthToken(rawToken, {
-      isProduction: config.environment === 'production',
-      allowSandbox: config.allowSandbox,
-      jwtSecret: config.jwtSecret,
-      requiredScopes: ['dns:delete:approve']
-    });
-
-    if (!authResult.success) {
-      process.stderr.write(`[aeitron-mcp] ERROR: Operator authentication failed: ${authResult.error}\n`);
-      return { success: false, error: authResult.error };
-    }
-    operatorClaims = authResult.claims;
-  } else if (config.allowSandbox) {
-    operatorClaims = {
-      actorId: 'usr_operator_cli_dev',
-      tenantId: 'anonymous', // allows approving any local dev tenant request
-      tier: 'enterprise',
-      scopes: ['dns:delete:approve'],
-      livemode: false
-    };
-  } else {
-    process.stderr.write('[aeitron-mcp] ERROR: Operator authentication token required (--token or AEITRON_API_KEY).\n');
-    return { success: false, error: 'Operator authentication token required.' };
-  }
 
   // 1. If HTTP server URL is provided, attempt HTTP approval exclusively (no confusing local fallback)
   if (parsed.url) {
+    if (!rawToken && !config.allowSandbox) {
+      process.stderr.write('[aeitron-mcp] ERROR: Operator authentication token required for remote approval (--token or AEITRON_API_KEY).\n');
+      return { success: false, error: 'Operator authentication token required for remote approval.' };
+    }
+
     try {
       const targetUrl = `${parsed.url.replace(/\/+$/, '')}/v1/dns/approve-deletion`;
       const res = await fetch(targetUrl, {
@@ -131,7 +109,14 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
         return { success: false, error: String(data.error_description || data.error) };
       }
 
-      printApprovalSuccess(data as { requestId: string; domain: string; recordId: string; approvalToken: string; expiresAt: number }, operatorClaims);
+      const dummyClaims: AuthClaims = {
+        actorId: 'remote_operator',
+        tenantId: String(data.tenantId || 'remote_tenant'),
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: config.environment === 'production'
+      };
+      printApprovalSuccess(data as { requestId: string; domain: string; recordId: string; approvalToken: string; expiresAt: number }, dummyClaims);
       return { success: true, token: String(data.approvalToken) };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -141,6 +126,41 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
   }
 
   // 2. Direct authorization via persistent shared storage
+  const pending = getPendingDnsDeletionRequest(requestId);
+  if (!pending) {
+    process.stderr.write(`[aeitron-mcp] ERROR: Pending deletion request '${requestId}' not found or expired.\n`);
+    return { success: false, error: 'Pending deletion request not found or expired.' };
+  }
+
+  let operatorClaims: AuthClaims;
+  if (rawToken) {
+    const authResult = verifyAuthToken(rawToken, {
+      isProduction: config.environment === 'production',
+      allowSandbox: config.allowSandbox,
+      jwtSecret: config.jwtSecret,
+      requiredScopes: ['dns:delete:approve']
+    });
+
+    if (!authResult.success) {
+      process.stderr.write(`[aeitron-mcp] ERROR: Operator authentication failed: ${authResult.error}\n`);
+      return { success: false, error: authResult.error };
+    }
+    operatorClaims = authResult.claims;
+  } else if (config.allowSandbox) {
+    // In local sandbox mode, strictly bind the operator to the request's exact tenantId
+    // Zero 'anonymous' bypass allowed.
+    operatorClaims = {
+      actorId: 'usr_operator_cli_dev',
+      tenantId: pending.tenantId,
+      tier: 'enterprise',
+      scopes: ['dns:delete:approve'],
+      livemode: false
+    };
+  } else {
+    process.stderr.write('[aeitron-mcp] ERROR: Operator authentication token required (--token or AEITRON_API_KEY).\n');
+    return { success: false, error: 'Operator authentication token required.' };
+  }
+
   const result = authorizeDnsDeletionRequest(operatorClaims, requestId);
   if (!result.success) {
     process.stderr.write(`[aeitron-mcp] ERROR: Authorization rejected (${result.status}): ${result.error}\n`);

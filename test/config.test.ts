@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { getConfig } from '../src/config.js';
+import { getConfig, positiveIntEnv } from '../src/config.js';
 
 describe('Environment & Docker Configuration Suite', () => {
   const originalEnv = { ...process.env };
@@ -100,6 +100,50 @@ describe('Environment & Docker Configuration Suite', () => {
       () => getConfig(),
       /Invalid AEITRON_ENV/
     );
+  });
+
+  it('6. positiveIntEnv: parses valid positive integer and handles fallback', () => {
+    assert.equal(positiveIntEnv('NON_EXISTENT_VAR', 42), 42);
+
+    process.env.TEST_INT_VAR = '  100  ';
+    assert.equal(positiveIntEnv('TEST_INT_VAR', 42), 100);
+  });
+
+  it('7. positiveIntEnv: strictly throws on NaN, non-numeric, decimals, and negative numbers', () => {
+    process.env.TEST_INT_VAR = 'not_a_number';
+    assert.throws(() => positiveIntEnv('TEST_INT_VAR', 10), /must be a positive integer/);
+
+    process.env.TEST_INT_VAR = '123abc';
+    assert.throws(() => positiveIntEnv('TEST_INT_VAR', 10), /must be a positive integer/);
+
+    process.env.TEST_INT_VAR = '-5';
+    assert.throws(() => positiveIntEnv('TEST_INT_VAR', 10), /must be a positive integer/);
+
+    process.env.TEST_INT_VAR = '12.34';
+    assert.throws(() => positiveIntEnv('TEST_INT_VAR', 10), /must be a positive integer/);
+  });
+
+  it('8. positiveIntEnv: strictly enforces bounds (min and max)', () => {
+    process.env.TEST_INT_VAR = '0';
+    assert.throws(() => positiveIntEnv('TEST_INT_VAR', 10, 1, 100), /must be between 1 and 100/);
+
+    process.env.TEST_INT_VAR = '101';
+    assert.throws(() => positiveIntEnv('TEST_INT_VAR', 10, 1, 100), /must be between 1 and 100/);
+  });
+
+  it('9. Fail-Closed on Malformed Numeric Config: rejects NaN in AEITRON_MAX_ACTIVE_SESSIONS', () => {
+    process.env.AEITRON_MAX_ACTIVE_SESSIONS = 'invalid_number';
+    assert.throws(() => getConfig(), /AEITRON_MAX_ACTIVE_SESSIONS must be a positive integer/);
+  });
+
+  it('10. Fail-Closed on Malformed Numeric Config: rejects NaN in AEITRON_REQUEST_TIMEOUT_MS', () => {
+    process.env.AEITRON_REQUEST_TIMEOUT_MS = 'bad_timeout';
+    assert.throws(() => getConfig(), /AEITRON_REQUEST_TIMEOUT_MS must be a positive integer/);
+  });
+
+  it('11. Fail-Closed on Malformed Numeric Config: rejects negative AEITRON_SESSION_IDLE_TIMEOUT_MS', () => {
+    process.env.AEITRON_SESSION_IDLE_TIMEOUT_MS = '-500';
+    assert.throws(() => getConfig(), /AEITRON_SESSION_IDLE_TIMEOUT_MS must be a positive integer/);
   });
 });
 

@@ -212,6 +212,10 @@ export function loadOrGenerateRsaKeyPair(): RsaKeyPair {
   const envPrivate = process.env.AEITRON_RSA_PRIVATE_KEY || process.env.AEITRON_JWT_PRIVATE_KEY;
   const envPublic = process.env.AEITRON_RSA_PUBLIC_KEY || process.env.AEITRON_JWT_PUBLIC_KEY;
 
+  if (!envPrivate && envPublic && isHardenedEnvironment()) {
+    throw new Error('CRITICAL CONFIGURATION ERROR: RSA public key is configured without a corresponding private signing key.');
+  }
+
   if (envPrivate) {
     if (envPublic) {
       if (!verifyRsaKeyPairMatch(envPrivate, envPublic)) {
@@ -361,6 +365,79 @@ export function registerHistoricalRsaKeyForTesting(kid: string, publicKeyPem: st
   registerPublicKey(kid, publicKeyPem, false);
 }
 
+// Synchronous sleep helper for atomic lock backoff
+function sleepSync(ms: number): void {
+  try {
+    const sab = new SharedArrayBuffer(4);
+    const int32 = new Int32Array(sab);
+    Atomics.wait(int32, 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {}
+  }
+}
+
+/**
+ * Cross-process atomic lock using exclusive lockfile flag 'wx'.
+ * Handles stale locks (>10s old) and retries with backoff up to 5000ms.
+ */
+function acquireDnsStateLock(): () => void {
+  const dir = ensureStorageDir();
+  const lockPath = path.join(dir, 'dns-deletion-state.lock');
+  const maxWaitMs = 5000;
+  const start = Date.now();
+  let fd: number | null = null;
+
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      fd = fs.openSync(lockPath, 'wx');
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+      break;
+    } catch (err: unknown) {
+      const code = (err as { code?: string })?.code;
+      if (code === 'EEXIST' || code === 'EBUSY') {
+        try {
+          const stats = fs.statSync(lockPath);
+          if (Date.now() - stats.mtimeMs > 10000) {
+            try {
+              fs.unlinkSync(lockPath);
+            } catch {}
+          }
+        } catch {}
+        sleepSync(20);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (fd === null) {
+    throw new Error('TIMEOUT: Failed to acquire DNS state lock within 5000ms.');
+  }
+
+  return () => {
+    try {
+      if (fd !== null) {
+        fs.closeSync(fd);
+      }
+    } catch {}
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {}
+  };
+}
+
+export function withDnsStateLock<T>(fn: () => T): T {
+  const release = acquireDnsStateLock();
+  try {
+    return fn();
+  } finally {
+    release();
+  }
+}
+
+export type DnsDeletionStatus = 'pending' | 'approved' | 'executing' | 'completed' | 'failed';
+
 // Pending deletion requests awaiting human operator approval
 export interface PendingDeletionRequest {
   requestId: string;
@@ -370,21 +447,91 @@ export interface PendingDeletionRequest {
   recordId: string;
   createdAt: number;
   expiresAt: number;
+  status: DnsDeletionStatus;
   authorized: boolean;
   authorizedBy?: string;
   authorizedAt?: number;
+  approvalTokenHash?: string;
   approvalToken?: string;
   consumed?: boolean;
   consumedAt?: number;
+  completedAt?: number;
 }
 
 const PENDING_DELETION_REQUESTS = new Map<string, PendingDeletionRequest>();
 const CONSUMED_APPROVAL_TOKENS = new Set<string>();
 
-interface DnsStatePayload {
+export interface DnsStatePayload {
   version: 1;
   requests: PendingDeletionRequest[];
   consumedTokenHashes: string[];
+}
+
+export function validateDnsStatePayload(data: unknown): DnsStatePayload {
+  if (typeof data !== 'object' || data === null) {
+    throw new Error('Invalid state file: root must be an object');
+  }
+  const obj = data as Record<string, unknown>;
+  if (obj.version !== 1) {
+    throw new Error(`Invalid state file: unsupported version '${obj.version}', expected 1`);
+  }
+  if (!Array.isArray(obj.requests)) {
+    throw new Error('Invalid state file: requests must be an array');
+  }
+  if (!Array.isArray(obj.consumedTokenHashes)) {
+    throw new Error('Invalid state file: consumedTokenHashes must be an array');
+  }
+
+  const validRequests: PendingDeletionRequest[] = [];
+  for (const item of obj.requests) {
+    if (typeof item !== 'object' || item === null) {
+      throw new Error('Invalid state file: request entry must be an object');
+    }
+    const r = item as Record<string, unknown>;
+    if (
+      typeof r.requestId !== 'string' ||
+      typeof r.tenantId !== 'string' ||
+      typeof r.actorId !== 'string' ||
+      typeof r.domain !== 'string' ||
+      typeof r.recordId !== 'string' ||
+      typeof r.createdAt !== 'number' ||
+      typeof r.expiresAt !== 'number'
+    ) {
+      throw new Error(`Invalid state file: missing or invalid required fields in request ${r.requestId || 'unknown'}`);
+    }
+    validRequests.push({
+      requestId: r.requestId,
+      tenantId: r.tenantId,
+      actorId: r.actorId,
+      domain: r.domain,
+      recordId: r.recordId,
+      createdAt: r.createdAt,
+      expiresAt: r.expiresAt,
+      status: (r.status as DnsDeletionStatus) || (r.consumed ? 'completed' : r.authorized ? 'approved' : 'pending'),
+      authorized: Boolean(r.authorized),
+      authorizedBy: typeof r.authorizedBy === 'string' ? r.authorizedBy : undefined,
+      authorizedAt: typeof r.authorizedAt === 'number' ? r.authorizedAt : undefined,
+      approvalTokenHash: typeof r.approvalTokenHash === 'string' ? r.approvalTokenHash : undefined,
+      approvalToken: typeof r.approvalToken === 'string' ? r.approvalToken : undefined,
+      consumed: Boolean(r.consumed),
+      consumedAt: typeof r.consumedAt === 'number' ? r.consumedAt : undefined,
+      completedAt: typeof r.completedAt === 'number' ? r.completedAt : undefined
+    });
+  }
+
+  const validHashes: string[] = [];
+  for (const h of obj.consumedTokenHashes) {
+    if (typeof h !== 'string' || h.length !== 64) {
+      throw new Error(`Invalid state file: consumedTokenHash must be a 64-char SHA-256 hex string, got '${h}'`);
+    }
+    validHashes.push(h);
+  }
+
+  return {
+    version: 1,
+    requests: validRequests,
+    consumedTokenHashes: validHashes
+  };
 }
 
 function getDnsStateFilePath(): string {
@@ -405,27 +552,23 @@ function loadDnsStateFromDisk(): void {
   if (fs.existsSync(stateFile)) {
     try {
       const content = fs.readFileSync(stateFile, 'utf-8');
-      const data: DnsStatePayload = JSON.parse(content);
+      const raw = JSON.parse(content);
+      const data = validateDnsStatePayload(raw);
       const now = Date.now();
-      if (Array.isArray(data.requests)) {
-        for (const item of data.requests) {
-          if (item.requestId && item.expiresAt > now && !item.consumed) {
-            PENDING_DELETION_REQUESTS.set(item.requestId, item);
-          }
+      for (const item of data.requests) {
+        if (item.requestId && item.expiresAt > now && item.status !== 'completed' && item.status !== 'failed') {
+          PENDING_DELETION_REQUESTS.set(item.requestId, item);
         }
       }
-      if (Array.isArray(data.consumedTokenHashes)) {
-        for (const hash of data.consumedTokenHashes) {
-          if (typeof hash === 'string') {
-            CONSUMED_APPROVAL_TOKENS.add(hash);
-          }
-        }
+      for (const hash of data.consumedTokenHashes) {
+        CONSUMED_APPROVAL_TOKENS.add(hash);
       }
       return;
     } catch (err) {
       if (isHardenedEnvironment()) {
-        throw new Error(`CRITICAL: Unable to read security state file '${stateFile}': ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(`CRITICAL: Security state file '${stateFile}' failed validation or reading: ${err instanceof Error ? err.message : String(err)}`);
       }
+      process.stderr.write(`[aeitron-mcp][WARN] Failed to parse/validate state file '${stateFile}': ${err instanceof Error ? err.message : String(err)}\n`);
     }
   }
 
@@ -437,7 +580,10 @@ function loadDnsStateFromDisk(): void {
         const now = Date.now();
         for (const item of data) {
           if (item.requestId && item.expiresAt > now && !item.consumed) {
-            PENDING_DELETION_REQUESTS.set(item.requestId, item);
+            PENDING_DELETION_REQUESTS.set(item.requestId, {
+              ...item,
+              status: item.authorized ? 'approved' : 'pending'
+            });
           }
         }
       }
@@ -471,7 +617,11 @@ function saveDnsStateToDisk(): void {
   try {
     const payload: DnsStatePayload = {
       version: 1,
-      requests: Array.from(PENDING_DELETION_REQUESTS.values()),
+      requests: Array.from(PENDING_DELETION_REQUESTS.values()).map((r) => ({
+        ...r,
+        // Redact plaintext token so sensitive credentials are never stored on disk
+        approvalToken: undefined
+      })),
       consumedTokenHashes: Array.from(CONSUMED_APPROVAL_TOKENS)
     };
     const tempStateFile = `${stateFile}.tmp.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
@@ -531,31 +681,39 @@ export function clearTestRegistries(): void {
  * Retrieves a pending DNS deletion request by ID (verifying TTL)
  */
 export function getPendingDnsDeletionRequest(requestId: string): PendingDeletionRequest | undefined {
-  loadDnsStateFromDisk();
-  const req = PENDING_DELETION_REQUESTS.get(requestId);
-  if (req && Date.now() > req.expiresAt) {
-    PENDING_DELETION_REQUESTS.delete(requestId);
-    saveDnsStateToDisk();
-    return undefined;
-  }
-  return req;
+  return withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+    const req = PENDING_DELETION_REQUESTS.get(requestId);
+    if (req && Date.now() > req.expiresAt) {
+      PENDING_DELETION_REQUESTS.delete(requestId);
+      saveDnsStateToDisk();
+      return undefined;
+    }
+    return req;
+  });
 }
 
 /**
- * Lists pending DNS deletion requests, optionally filtered by tenant ID
+ * Lists pending DNS deletion requests, strictly filtered by tenant ID.
+ * Fail-Closed: anonymous or missing tenant cannot enumerate requests across all tenants.
  */
 export function listPendingDnsDeletionRequests(tenantId?: string): PendingDeletionRequest[] {
-  loadDnsStateFromDisk();
-  const now = Date.now();
-  const results: PendingDeletionRequest[] = [];
-  for (const req of PENDING_DELETION_REQUESTS.values()) {
-    if (req.expiresAt > now && !req.consumed) {
-      if (!tenantId || tenantId === 'anonymous' || req.tenantId === tenantId) {
-        results.push(req);
+  return withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+    if (!tenantId || tenantId === 'anonymous') {
+      return [];
+    }
+    const now = Date.now();
+    const results: PendingDeletionRequest[] = [];
+    for (const req of PENDING_DELETION_REQUESTS.values()) {
+      if (req.expiresAt > now && !req.consumed && req.status === 'pending') {
+        if (req.tenantId === tenantId) {
+          results.push(req);
+        }
       }
     }
-  }
-  return results;
+    return results;
+  });
 }
 
 /**
@@ -1019,25 +1177,28 @@ export function createDnsDeletionRequest(
   domain: string,
   recordId: string
 ): { requestId: string; expiresAt: number } {
-  loadDnsStateFromDisk();
-  const requestId = `del_req_${crypto.randomBytes(16).toString('hex')}`;
-  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minute validity window
+  return withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+    const requestId = `del_req_${crypto.randomBytes(16).toString('hex')}`;
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minute validity window
 
-  const record: PendingDeletionRequest = {
-    requestId,
-    tenantId,
-    actorId,
-    domain,
-    recordId,
-    createdAt: Date.now(),
-    expiresAt,
-    authorized: false
-  };
+    const record: PendingDeletionRequest = {
+      requestId,
+      tenantId,
+      actorId,
+      domain,
+      recordId,
+      createdAt: Date.now(),
+      expiresAt,
+      status: 'pending',
+      authorized: false
+    };
 
-  PENDING_DELETION_REQUESTS.set(requestId, record);
-  saveDnsStateToDisk();
+    PENDING_DELETION_REQUESTS.set(requestId, record);
+    saveDnsStateToDisk();
 
-  return { requestId, expiresAt };
+    return { requestId, expiresAt };
+  });
 }
 
 /**
@@ -1074,54 +1235,60 @@ export function authorizeDnsDeletionRequest(
     };
   }
 
-  loadDnsStateFromDisk();
-  const req = PENDING_DELETION_REQUESTS.get(requestId);
-  if (!req) {
-    return { success: false, status: 404, error: 'Pending deletion request not found or expired.' };
-  }
+  return withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+    const req = PENDING_DELETION_REQUESTS.get(requestId);
+    if (!req) {
+      return { success: false, status: 404, error: 'Pending deletion request not found or expired.' };
+    }
 
-  // 2. Strict Independent Human Approval Guard: Creator cannot self-approve
-  if (operatorClaims.actorId === req.actorId) {
-    return {
-      success: false,
-      status: 403,
-      error: 'Security Policy Violation: Request creators cannot approve their own DNS deletion requests. Independent human operator authorization required.'
-    };
-  }
+    // 2. Strict Independent Human Approval Guard: Creator cannot self-approve
+    if (operatorClaims.actorId === req.actorId) {
+      return {
+        success: false,
+        status: 403,
+        error: 'Security Policy Violation: Request creators cannot approve their own DNS deletion requests. Independent human operator authorization required.'
+      };
+    }
 
-  // 3. Request state checks (unexpired, not consumed, not already authorized)
-  if (Date.now() > req.expiresAt) {
-    PENDING_DELETION_REQUESTS.delete(requestId);
+    // 3. Request state checks (unexpired, not consumed, not already authorized)
+    if (Date.now() > req.expiresAt) {
+      PENDING_DELETION_REQUESTS.delete(requestId);
+      saveDnsStateToDisk();
+      return { success: false, status: 410, error: 'Pending deletion request has expired.' };
+    }
+    if (req.status === 'completed' || req.consumed) {
+      return { success: false, status: 410, error: 'Pending deletion request has already been executed/consumed.' };
+    }
+    if (req.status === 'approved' || req.authorized) {
+      return { success: false, status: 410, error: 'Pending deletion request has already been authorized.' };
+    }
+
+    // 4. Tenant isolation check (Zero 'anonymous' bypass allowed)
+    if (!operatorClaims.tenantId || operatorClaims.tenantId === 'anonymous' || req.tenantId !== operatorClaims.tenantId) {
+      return { success: false, status: 403, error: 'Operator tenant does not match deletion request tenant.' };
+    }
+
+    const challenge = createAuthorizedDnsDeletionToken(req.tenantId, req.domain, req.recordId, req.requestId, secret);
+    const tokenHash = crypto.createHash('sha256').update(challenge.token).digest('hex');
+
+    req.status = 'approved';
+    req.authorized = true;
+    req.authorizedBy = operatorClaims.actorId;
+    req.authorizedAt = Date.now();
+    req.approvalTokenHash = tokenHash;
+    req.approvalToken = challenge.token;
     saveDnsStateToDisk();
-    return { success: false, status: 410, error: 'Pending deletion request has expired.' };
-  }
-  if (req.consumed) {
-    return { success: false, status: 410, error: 'Pending deletion request has already been executed/consumed.' };
-  }
-  if (req.authorized) {
-    return { success: false, status: 410, error: 'Pending deletion request has already been authorized.' };
-  }
 
-  // 4. Tenant isolation check
-  if (operatorClaims.tenantId !== 'anonymous' && req.tenantId !== operatorClaims.tenantId) {
-    return { success: false, status: 403, error: 'Operator tenant does not match deletion request tenant.' };
-  }
-
-  const challenge = createAuthorizedDnsDeletionToken(req.tenantId, req.domain, req.recordId, req.requestId, secret);
-  req.authorized = true;
-  req.authorizedBy = operatorClaims.actorId;
-  req.authorizedAt = Date.now();
-  req.approvalToken = challenge.token;
-  saveDnsStateToDisk();
-
-  return {
-    success: true,
-    token: challenge.token,
-    expiresAt: challenge.expiresAt,
-    requestId: req.requestId,
-    domain: req.domain,
-    recordId: req.recordId
-  };
+    return {
+      success: true,
+      token: challenge.token,
+      expiresAt: challenge.expiresAt,
+      requestId: req.requestId,
+      domain: req.domain,
+      recordId: req.recordId
+    };
+  });
 }
 
 /**
@@ -1207,15 +1374,9 @@ export function verifyAndConsumeDnsDeletionApproval(
   expectedDomain: string,
   expectedRecordId: string,
   secret?: string
-): { valid: boolean; error?: string } {
+): { valid: true; requestId: string } | { valid: false; error: string } {
   if (!challengeToken || !challengeToken.startsWith('del_tok_')) {
     return { valid: false, error: 'Invalid challenge token format. Expected "del_tok_..." token.' };
-  }
-
-  loadDnsStateFromDisk();
-  const tokenHash = crypto.createHash('sha256').update(challengeToken).digest('hex');
-  if (CONSUMED_APPROVAL_TOKENS.has(tokenHash)) {
-    return { valid: false, error: 'Approval token has already been consumed (replay attempt detected).' };
   }
 
   const raw = challengeToken.slice('del_tok_'.length);
@@ -1240,43 +1401,57 @@ export function verifyAndConsumeDnsDeletionApproval(
     return { valid: false, error: 'Cryptographic challenge token signature mismatch.' };
   }
 
+  let payload: Record<string, unknown>;
   try {
-    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8'));
-    if (payload.action !== 'dns_delete_challenge') {
-      return { valid: false, error: 'Invalid challenge action payload.' };
-    }
-    if (Date.now() > payload.expiresAt) {
-      return { valid: false, error: 'Challenge approval token has expired (5-minute TTL exceeded).' };
-    }
-    if (payload.domain !== expectedDomain || payload.recordId !== expectedRecordId) {
-      return { valid: false, error: 'Challenge approval token does not match target domain or record ID.' };
-    }
-    if (expectedTenantId !== 'anonymous' && payload.tenantId !== expectedTenantId) {
-      return { valid: false, error: 'Challenge approval token tenant mismatch.' };
+    payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8'));
+  } catch {
+    return { valid: false, error: 'Failed to decode challenge token payload.' };
+  }
+
+  if (payload.action !== 'dns_delete_challenge') {
+    return { valid: false, error: 'Invalid challenge action payload.' };
+  }
+  if (typeof payload.expiresAt !== 'number' || Date.now() > payload.expiresAt) {
+    return { valid: false, error: 'Challenge approval token has expired (5-minute TTL exceeded).' };
+  }
+  if (payload.domain !== expectedDomain || payload.recordId !== expectedRecordId) {
+    return { valid: false, error: 'Challenge approval token does not match target domain or record ID.' };
+  }
+  if (!expectedTenantId || expectedTenantId === 'anonymous' || payload.tenantId !== expectedTenantId) {
+    return { valid: false, error: 'Challenge approval token tenant mismatch.' };
+  }
+
+  // MANDATORY REQUEST ID ENFORCEMENT & DURABLE BINDING
+  if (!payload.requestId || typeof payload.requestId !== 'string') {
+    return {
+      valid: false,
+      error: 'Security Error: Approval token is missing mandatory requestId. Human operator authorization required.'
+    };
+  }
+
+  const tokenHash = crypto.createHash('sha256').update(challengeToken).digest('hex');
+
+  return withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+
+    if (CONSUMED_APPROVAL_TOKENS.has(tokenHash)) {
+      return { valid: false, error: 'Approval token has already been consumed (replay attempt detected).' };
     }
 
-    // MANDATORY REQUEST ID ENFORCEMENT & DURABLE BINDING
-    if (!payload.requestId) {
-      return {
-        valid: false,
-        error: 'Security Error: Approval token is missing mandatory requestId. Human operator authorization required.'
-      };
-    }
-
-    const req = PENDING_DELETION_REQUESTS.get(payload.requestId);
+    const req = PENDING_DELETION_REQUESTS.get(payload.requestId as string);
     if (!req) {
       return {
         valid: false,
         error: `Referenced deletion request '${payload.requestId}' was not found or has expired.`
       };
     }
-    if (!req.authorized) {
+    if (!req.authorized || req.status === 'pending') {
       return {
         valid: false,
         error: `Referenced deletion request '${payload.requestId}' has not been authorized by an operator.`
       };
     }
-    if (req.consumed) {
+    if (req.status === 'completed' || req.consumed) {
       return {
         valid: false,
         error: `Referenced deletion request '${payload.requestId}' has already been consumed (replay attempt detected).`
@@ -1286,6 +1461,12 @@ export function verifyAndConsumeDnsDeletionApproval(
       return {
         valid: false,
         error: `Referenced deletion request '${payload.requestId}' has expired.`
+      };
+    }
+    if (req.approvalTokenHash && req.approvalTokenHash !== tokenHash) {
+      return {
+        valid: false,
+        error: 'Challenge approval token does not match authorized token issued for this request.'
       };
     }
     if (req.approvalToken && req.approvalToken !== challengeToken) {
@@ -1300,24 +1481,51 @@ export function verifyAndConsumeDnsDeletionApproval(
         error: 'Referenced deletion request parameters do not match target domain or record ID.'
       };
     }
-    if (expectedTenantId !== 'anonymous' && req.tenantId !== expectedTenantId) {
+    if (!expectedTenantId || expectedTenantId === 'anonymous' || req.tenantId !== expectedTenantId) {
       return {
         valid: false,
         error: 'Referenced deletion request tenant does not match caller tenant.'
       };
     }
 
-    // Atomically mark request as consumed
+    // Atomically transition state to 'executing' and record consumed token
+    req.status = 'executing';
     req.consumed = true;
     req.consumedAt = Date.now();
-
-    // Atomically consume token to prevent replay
     CONSUMED_APPROVAL_TOKENS.add(tokenHash);
     saveDnsStateToDisk();
-    return { valid: true };
-  } catch {
-    return { valid: false, error: 'Failed to decode challenge token payload.' };
-  }
+
+    return { valid: true, requestId: req.requestId };
+  });
+}
+
+/**
+ * Transitions a DNS deletion request to completed status after successful upstream execution.
+ */
+export function markDnsDeletionCompleted(requestId: string): void {
+  withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+    const req = PENDING_DELETION_REQUESTS.get(requestId);
+    if (req) {
+      req.status = 'completed';
+      req.completedAt = Date.now();
+      saveDnsStateToDisk();
+    }
+  });
+}
+
+/**
+ * Transitions a DNS deletion request to failed status if upstream execution failed.
+ */
+export function markDnsDeletionFailed(requestId: string): void {
+  withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+    const req = PENDING_DELETION_REQUESTS.get(requestId);
+    if (req) {
+      req.status = 'failed';
+      saveDnsStateToDisk();
+    }
+  });
 }
 
 // Backwards-compatible alias
@@ -1477,11 +1685,13 @@ export interface DnsDeletionRequestDto {
   recordId: string;
   createdAt: number;
   expiresAt: number;
+  status: DnsDeletionStatus;
   authorized: boolean;
   authorizedBy?: string;
   authorizedAt?: number;
   consumed: boolean;
   consumedAt?: number;
+  completedAt?: number;
 }
 
 export function toRedactedDnsRequestDto(req: PendingDeletionRequest): DnsDeletionRequestDto {
@@ -1493,11 +1703,13 @@ export function toRedactedDnsRequestDto(req: PendingDeletionRequest): DnsDeletio
     recordId: req.recordId,
     createdAt: req.createdAt,
     expiresAt: req.expiresAt,
+    status: req.status || (req.consumed ? 'completed' : req.authorized ? 'approved' : 'pending'),
     authorized: req.authorized,
     authorizedBy: req.authorizedBy,
     authorizedAt: req.authorizedAt,
     consumed: req.consumed || false,
-    consumedAt: req.consumedAt
+    consumedAt: req.consumedAt,
+    completedAt: req.completedAt
   };
 }
 

@@ -683,4 +683,55 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
       assert.strictEqual(req['approvalToken'], undefined, 'approvalToken MUST NOT be present in read DTO');
     }
   });
+
+  it('25. Production SSE Handshake: strictly rejects token in URL query with HTTP 400 Invalid Authentication Transport', async () => {
+    const prodServer = createMcpHttpServer({
+      environment: 'production',
+      jwtSecret: 'production_secret_32_chars_long_for_test!!'
+    });
+
+    let prodUrl = '';
+    await new Promise<void>((resolve) => {
+      prodServer.httpServer.listen(0, '127.0.0.1', () => {
+        const addr = prodServer.httpServer.address();
+        const port = typeof addr === 'object' && addr !== null ? addr.port : 0;
+        prodUrl = `http://127.0.0.1:${port}`;
+        resolve();
+      });
+    });
+
+    try {
+      const res = await fetch(`${prodUrl}/mcp/sse?token=some_token`);
+      assert.equal(res.status, 400);
+      const body = await res.json() as { type: string; title: string; status: number };
+      assert.equal(body.status, 400);
+      assert.equal(body.title, 'Invalid Authentication Transport');
+    } finally {
+      await prodServer.close();
+    }
+  });
+
+  it('26. Streamable HTTP Session Failure: cleans up session resources and does not leak sessions on failure', async () => {
+    const healthBeforeRes = await fetch(`${baseUrl}/health`);
+    const healthBefore = await healthBeforeRes.json() as { activeSessions: number };
+    const sessionsBefore = healthBefore.activeSessions;
+
+    // Make an invalid request to /mcp with broken body / headers that fails handler execution
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer atk_sandbox_live_e2e_test',
+        'Accept': 'text/plain' // non-mcp accept
+      },
+      body: '{"invalid": json'
+    });
+
+    assert.ok(res.status >= 400 && res.status <= 500);
+
+    const healthAfterRes = await fetch(`${baseUrl}/health`);
+    const healthAfter = await healthAfterRes.json() as { activeSessions: number };
+    // Verify active sessions count remains unchanged (no leaked session reservation)
+    assert.equal(healthAfter.activeSessions, sessionsBefore);
+  });
 });

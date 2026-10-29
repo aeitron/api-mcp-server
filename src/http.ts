@@ -546,22 +546,26 @@ export function createMcpHttpServer(
           return;
         }
 
+        let sessionId: string | undefined;
+        let transport: StreamableHTTPServerTransport | undefined;
+        let serverInstance: ReturnType<typeof createAeitronMcpServer> | undefined;
+
         try {
           // Fresh session initialization or stateless invocation
-          const sessionId = crypto.randomUUID();
+          sessionId = crypto.randomUUID();
           const apiClient = new AeitronApiClient({
             ...config,
             defaultApiKey: auth.token
           });
 
-          const serverInstance = createAeitronMcpServer({
+          serverInstance = createAeitronMcpServer({
             config,
             client: apiClient,
             authClaims: auth.claims
           });
 
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => sessionId,
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => sessionId!,
             enableJsonResponse: true,
             onsessionclosed: (closedId) => {
               streamableSessions.delete(closedId);
@@ -578,6 +582,31 @@ export function createMcpHttpServer(
           });
 
           await transport.handleRequest(req, res);
+          // If the initial request resulted in an error status, clean up immediately so dead sessions do not leak
+          if (res.statusCode >= 400) {
+            streamableSessions.delete(sessionId);
+            transport.close().catch(() => {});
+            serverInstance.server.close().catch(() => {});
+          }
+        } catch (err) {
+          if (sessionId) {
+            streamableSessions.delete(sessionId);
+          }
+          if (transport) {
+            transport.close().catch(() => {});
+          }
+          if (serverInstance) {
+            serverInstance.server.close().catch(() => {});
+          }
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/problem+json' });
+            res.end(JSON.stringify({
+              type: 'https://aeitron.com/errors/internal-server-error',
+              title: 'Internal Server Error',
+              status: 500,
+              detail: 'Failed to initialize or process MCP session request.'
+            }));
+          }
         } finally {
           releaseSessionSlot();
         }
@@ -599,8 +628,17 @@ export function createMcpHttpServer(
 
       // Authenticate SSE connection
       const { token: rawToken, wasInQuery } = extractTokenFromRequest(req, parsedUrl);
-      if (wasInQuery && config.environment === 'production') {
-        process.stderr.write('[aeitron-mcp][WARN] Token provided via query parameter in production. Authorization: Bearer <token> header is strongly recommended.\n');
+      if (wasInQuery && (config.environment === 'production' || config.environment === 'staging')) {
+        res.writeHead(400, {
+          'Content-Type': 'application/problem+json'
+        });
+        res.end(JSON.stringify({
+          type: 'https://aeitron.com/errors/invalid-auth-transport',
+          title: 'Invalid Authentication Transport',
+          status: 400,
+          detail: 'Passing authentication tokens via URL query parameters is strictly prohibited in production and staging environments. Use the Authorization: Bearer <token> header.'
+        }));
+        return;
       }
 
       const auth = verifyAuthToken(rawToken, {

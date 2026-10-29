@@ -21,6 +21,12 @@ import {
   authorizeDnsDeletionRequest,
   createAuthorizedDnsDeletionToken,
   loadOrGenerateRsaKeyPair,
+  listPendingDnsDeletionRequests,
+  validateDnsStatePayload,
+  markDnsDeletionCompleted,
+  markDnsDeletionFailed,
+  withDnsStateLock,
+  toRedactedDnsRequestDto,
   ACTIVE_KID
 } from '../src/auth.js';
 
@@ -588,7 +594,8 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
         issueDnsDeletionChallenge('tenant_acme', 'aeitron.com', 'rec_prod_1');
       }, /SECURITY VIOLATION.*hardened/);
     } finally {
-      process.env.AEITRON_ENV = prevEnv;
+      if (prevEnv !== undefined) process.env.AEITRON_ENV = prevEnv;
+      else delete process.env.AEITRON_ENV;
     }
   });
 
@@ -602,12 +609,154 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
         loadOrGenerateRsaKeyPair();
       }, /CRITICAL.*does not exist/);
     } finally {
-      process.env.AEITRON_ENV = prevEnv;
+      if (prevEnv !== undefined) process.env.AEITRON_ENV = prevEnv;
+      else delete process.env.AEITRON_ENV;
       if (prevKeyFile !== undefined) {
         process.env.AEITRON_RSA_KEY_FILE = prevKeyFile;
       } else {
         delete process.env.AEITRON_RSA_KEY_FILE;
       }
     }
+  });
+
+  it('loadOrGenerateRsaKeyPair: strictly throws when RSA public key is configured without private key in hardened environment', () => {
+    const prevEnv = process.env.AEITRON_ENV;
+    const prevPub = process.env.AEITRON_RSA_PUBLIC_KEY;
+    const prevPriv = process.env.AEITRON_RSA_PRIVATE_KEY;
+    try {
+      process.env.AEITRON_ENV = 'production';
+      delete process.env.AEITRON_RSA_PRIVATE_KEY;
+      delete process.env.AEITRON_JWT_PRIVATE_KEY;
+      process.env.AEITRON_RSA_PUBLIC_KEY = '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0\n-----END PUBLIC KEY-----';
+      assert.throws(() => {
+        loadOrGenerateRsaKeyPair();
+      }, /CRITICAL CONFIGURATION ERROR: RSA public key is configured without a corresponding private signing key/);
+    } finally {
+      if (prevEnv !== undefined) process.env.AEITRON_ENV = prevEnv;
+      else delete process.env.AEITRON_ENV;
+      if (prevPub !== undefined) process.env.AEITRON_RSA_PUBLIC_KEY = prevPub;
+      else delete process.env.AEITRON_RSA_PUBLIC_KEY;
+      if (prevPriv !== undefined) process.env.AEITRON_RSA_PRIVATE_KEY = prevPriv;
+      else delete process.env.AEITRON_RSA_PRIVATE_KEY;
+    }
+  });
+
+  it('tenantId === "anonymous" strictly rejected on operator deletion approval', () => {
+    const req = createDnsDeletionRequest('tenant_customer_123', 'usr_creator', 'example.com', 'rec_123');
+    const authRes = authorizeDnsDeletionRequest(
+      {
+        actorId: 'usr_operator_anon',
+        tenantId: 'anonymous',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false
+      },
+      req.requestId
+    );
+
+    assert.equal(authRes.success, false);
+    if (!authRes.success) {
+      assert.equal(authRes.status, 403);
+      assert.ok(authRes.error.includes('tenant does not match'));
+    }
+  });
+
+  it('listPendingDnsDeletionRequests: returns empty array when tenantId is anonymous or missing', () => {
+    createDnsDeletionRequest('tenant_customer_456', 'usr_creator_2', 'example.com', 'rec_456');
+    assert.deepEqual(listPendingDnsDeletionRequests('anonymous'), []);
+    assert.deepEqual(listPendingDnsDeletionRequests(undefined), []);
+    const matching = listPendingDnsDeletionRequests('tenant_customer_456');
+    assert.ok(matching.length >= 1);
+  });
+
+  it('validateDnsStatePayload: strictly validates schema and rejects malformed state data', () => {
+    // 1. Root non-object
+    assert.throws(() => validateDnsStatePayload('invalid'), /root must be an object/);
+
+    // 2. Unsupported version
+    assert.throws(() => validateDnsStatePayload({ version: 2, requests: [], consumedTokenHashes: [] }), /unsupported version/);
+
+    // 3. Invalid requests array
+    assert.throws(() => validateDnsStatePayload({ version: 1, requests: 'not_an_array', consumedTokenHashes: [] }), /requests must be an array/);
+
+    // 4. Invalid consumedTokenHashes
+    assert.throws(() => validateDnsStatePayload({ version: 1, requests: [], consumedTokenHashes: ['short_hash'] }), /64-char SHA-256 hex string/);
+
+    // 5. Valid payload
+    const valid = validateDnsStatePayload({
+      version: 1,
+      requests: [
+        {
+          requestId: 'del_req_1',
+          tenantId: 'tenant_1',
+          actorId: 'usr_1',
+          domain: 'aeitron.com',
+          recordId: 'rec_1',
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 10000,
+          authorized: false
+        }
+      ],
+      consumedTokenHashes: [crypto.createHash('sha256').update('test_tok').digest('hex')]
+    });
+    assert.equal(valid.version, 1);
+    assert.equal(valid.requests.length, 1);
+    assert.equal(valid.requests[0].status, 'pending');
+  });
+
+  it('DNS deletion state machine: transitions from pending -> approved -> executing -> completed', () => {
+    const req = createDnsDeletionRequest('tenant_state_test', 'usr_client', 'example.com', 'rec_state_1');
+    assert.ok(req.requestId);
+
+    // 1. Operator authorizes
+    const authRes = authorizeDnsDeletionRequest(
+      {
+        actorId: 'usr_operator_state',
+        tenantId: 'tenant_state_test',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false
+      },
+      req.requestId
+    );
+    assert.equal(authRes.success, true);
+    if (!authRes.success) return;
+
+    // 2. Consume approval token -> transitions to 'executing'
+    const consumeRes = verifyDnsDeletionChallenge(
+      authRes.token,
+      'tenant_state_test',
+      'example.com',
+      'rec_state_1'
+    );
+    assert.equal(consumeRes.valid, true);
+    if (consumeRes.valid) {
+      assert.equal(consumeRes.requestId, req.requestId);
+    }
+
+    // 3. Mark completed after upstream DNS call
+    markDnsDeletionCompleted(req.requestId);
+
+    // 4. Verify replay is blocked
+    const replayRes = verifyDnsDeletionChallenge(
+      authRes.token,
+      'tenant_state_test',
+      'example.com',
+      'rec_state_1'
+    );
+    assert.equal(replayRes.valid, false);
+    if (!replayRes.valid) {
+      assert.ok(replayRes.error.includes('already been consumed'));
+    }
+  });
+
+  it('withDnsStateLock: acquires and releases cross-process lockfile safely', () => {
+    let executed = false;
+    const result = withDnsStateLock(() => {
+      executed = true;
+      return 'lock_success';
+    });
+    assert.equal(executed, true);
+    assert.equal(result, 'lock_success');
   });
 });

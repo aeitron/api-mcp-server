@@ -20,6 +20,26 @@ export interface McpServerConfig {
   rawOAuthClients?: string;
 }
 
+/**
+ * Strictly parses a positive integer environment variable.
+ * Fails closed on NaN, non-integer representations, negatives, decimals, or out-of-range values.
+ */
+export function positiveIntEnv(name: string, fallback: number, min = 1, max = Number.MAX_SAFE_INTEGER): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') {
+    return fallback;
+  }
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`FATAL CONFIGURATION ERROR: Environment variable ${name} must be a positive integer, got '${raw}'.`);
+  }
+  const parsed = parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    throw new Error(`FATAL CONFIGURATION ERROR: Environment variable ${name} must be between ${min} and ${max}, got ${parsed}.`);
+  }
+  return parsed;
+}
+
 export function getConfig(): McpServerConfig {
   const nodeEnv = (process.env.NODE_ENV || '').trim().toLowerCase();
   const rawAeitronEnv = process.env.AEITRON_ENV ? process.env.AEITRON_ENV.trim().toLowerCase() : undefined;
@@ -87,12 +107,12 @@ export function getConfig(): McpServerConfig {
     defaultApiKey: process.env.AEITRON_API_KEY || (isHardened ? undefined : 'atk_sandbox_dev_default_key'),
     environment,
     mockFallback,
-    requestTimeoutMs: parseInt(process.env.AEITRON_REQUEST_TIMEOUT_MS || '8000', 10),
+    requestTimeoutMs: positiveIntEnv('AEITRON_REQUEST_TIMEOUT_MS', 8000, 100, 300000),
     jwtSecret,
     corsAllowedOrigins,
     allowSandbox,
-    sessionIdleTimeoutMs: parseInt(process.env.AEITRON_SESSION_IDLE_TIMEOUT_MS || '1800000', 10), // 30 minutes default
-    maxActiveSessions: parseInt(process.env.AEITRON_MAX_ACTIVE_SESSIONS || '100', 10),
+    sessionIdleTimeoutMs: positiveIntEnv('AEITRON_SESSION_IDLE_TIMEOUT_MS', 1800000, 1000, 86400000), // 30 minutes default
+    maxActiveSessions: positiveIntEnv('AEITRON_MAX_ACTIVE_SESSIONS', 100, 1, 100000),
     storageDir: process.env.AEITRON_STORAGE_DIR || process.env.AEITRON_STATE_DIR || '',
     rawApiKeys: process.env.AEITRON_API_KEYS,
     rawOAuthClients: process.env.AEITRON_OAUTH_CLIENTS

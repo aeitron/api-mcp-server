@@ -12,7 +12,9 @@ import {
   AuthClaims,
   checkToolAuthorization,
   createDnsDeletionRequest,
-  verifyAndConsumeDnsDeletionApproval
+  verifyAndConsumeDnsDeletionApproval,
+  markDnsDeletionCompleted,
+  markDnsDeletionFailed
 } from '../auth.js';
 
 export function registerDnsTools(
@@ -342,10 +344,15 @@ export function registerDnsTools(
         };
       }
 
-      // 6. Perform Permanent Deletion
+      // 6. Perform Permanent Deletion with idempotencyKey binding
       const startTime = Date.now();
       try {
-        const result = await client.deleteDnsRecord(args);
+        const result = await client.deleteDnsRecord({
+          domain: args.domain,
+          recordId: args.recordId,
+          idempotencyKey: tokenVerification.requestId
+        });
+        markDnsDeletionCompleted(tokenVerification.requestId);
         const duration = Date.now() - startTime;
 
         audit.logToolExecution('delete_dns_record', args, duration, true, {
@@ -366,6 +373,7 @@ export function registerDnsTools(
           ]
         };
       } catch (err: unknown) {
+        markDnsDeletionFailed(tokenVerification.requestId);
         const duration = Date.now() - startTime;
         audit.logToolExecution('delete_dns_record', args, duration, false, {
           tenantId: authClaims?.tenantId,
