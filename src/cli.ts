@@ -73,6 +73,42 @@ EXAMPLES:
 \n`);
 }
 
+/**
+ * Safely parses and validates remote HTTP approval base URL.
+ * Strictly mandates HTTPS (permitting loopback HTTP only for local testing),
+ * prohibits embedded credentials, query parameters, or fragments,
+ * and sets the canonical path to /v1/dns/approve-deletion.
+ */
+export function buildApprovalUrl(rawBaseUrl: string): URL {
+  let url: URL;
+  try {
+    url = new URL(rawBaseUrl);
+  } catch {
+    throw new Error(`Invalid base URL: '${rawBaseUrl}'`);
+  }
+
+  if (url.username || url.password) {
+    throw new Error('Approval URL must not contain embedded user credentials.');
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+  if (url.protocol === 'http:') {
+    if (!isLoopback) {
+      throw new Error(`Insecure HTTP is only permitted for loopback addresses (localhost/127.0.0.1/::1). Use HTTPS for remote host '${hostname}'.`);
+    }
+  } else if (url.protocol !== 'https:') {
+    throw new Error(`Invalid protocol '${url.protocol}'. Only HTTPS (or loopback HTTP) is supported.`);
+  }
+
+  if (url.search || url.hash) {
+    throw new Error('Approval URL must not contain query parameters or fragments.');
+  }
+
+  url.pathname = '/v1/dns/approve-deletion';
+  return url;
+}
+
 export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{ success: boolean; token?: string; error?: string }> {
   const config = getConfig();
   const requestId = parsed.requestId;
@@ -93,9 +129,10 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
     }
 
     try {
-      const targetUrl = `${parsed.url.replace(/\/+$/, '')}/v1/dns/approve-deletion`;
+      const targetUrl = buildApprovalUrl(parsed.url);
       const res = await fetch(targetUrl, {
         method: 'POST',
+        redirect: 'error',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${rawToken || 'atk_sandbox_dev_default_key'}`

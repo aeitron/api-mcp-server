@@ -28,6 +28,7 @@ import {
   listPendingDnsDeletionRequests,
   toRedactedDnsRequestDto,
   reconcileDnsDeletionStatus,
+  hasRecentHumanMfa,
   isStorageReady,
   isRsaReady
 } from './auth.js';
@@ -320,15 +321,7 @@ export function createMcpHttpServer(
     }
 
     // P1 Guard: DNS deletion approval requires a verified human operator with recent MFA
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    const isHuman = auth.claims.actorType === 'human';
-    const hasMfa = auth.claims.authMethods?.includes('mfa') === true;
-    const isRecentAuth =
-      typeof auth.claims.authTime === 'number' &&
-      nowSeconds >= auth.claims.authTime &&
-      nowSeconds - auth.claims.authTime <= 300;
-
-    if (!isHuman || !hasMfa || !isRecentAuth) {
+    if (!hasRecentHumanMfa(auth.claims)) {
       return c.json({
         error: 'human_verification_required',
         error_description: 'DNS deletion approval requires an authenticated human operator with recent MFA verification (within 5 minutes).'

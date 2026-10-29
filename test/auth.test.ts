@@ -35,6 +35,10 @@ import {
   isRsaReady,
   withDnsStateLock,
   toRedactedDnsRequestDto,
+  hasRecentHumanMfa,
+  checkDnsDeletionRateLimit,
+  MAX_DNS_RATE_LIMIT_BUCKETS,
+  _clearDnsDeletionRateLimits,
   ACTIVE_KID
 } from '../src/auth.js';
 
@@ -527,7 +531,10 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
       tenantId: 'tenant_acme',
       tier: 'enterprise',
       scopes: ['dns:delete:approve'],
-      livemode: false
+      livemode: false,
+      actorType: 'human',
+      authMethods: ['mfa'],
+      authTime: Math.floor(Date.now() / 1000)
     }, req.requestId);
     assert.equal(authRes.success, true);
 
@@ -559,7 +566,10 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
       tenantId: 'tenant_acme',
       tier: 'enterprise',
       scopes: ['dns:delete:approve'],
-      livemode: false
+      livemode: false,
+      actorType: 'human',
+      authMethods: ['mfa'],
+      authTime: Math.floor(Date.now() / 1000)
     }, req.requestId);
     assert.equal(authRes.success, false);
     assert.equal(authRes.status, 403);
@@ -568,12 +578,15 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
 
   it('DNS deletion approval hardening: strictly rejects approval if operator lacks dns:delete:approve scope', () => {
     const req = createDnsDeletionRequest('tenant_acme', 'usr_requester', 'aeitron.com', 'rec_scope_test');
-    const authRes = authorizeDnsDeletionRequest({
+    const authRes =  authorizeDnsDeletionRequest({
       actorId: 'usr_operator_diff',
       tenantId: 'tenant_acme',
       tier: 'enterprise',
       scopes: ['dns:write:delete'], // Only dns:write:delete, missing dns:delete:approve
-      livemode: false
+      livemode: false,
+      actorType: 'human',
+      authMethods: ['mfa'],
+      authTime: Math.floor(Date.now() / 1000)
     }, req.requestId);
     assert.equal(authRes.success, false);
     assert.equal(authRes.status, 403);
@@ -587,7 +600,10 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
       tenantId: 'tenant_evil_corp',
       tier: 'enterprise',
       scopes: ['dns:delete:approve'],
-      livemode: false
+      livemode: false,
+      actorType: 'human',
+      authMethods: ['mfa'],
+      authTime: Math.floor(Date.now() / 1000)
     }, req.requestId);
     assert.equal(authRes.success, false);
     assert.equal(authRes.status, 403);
@@ -657,7 +673,10 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
         tenantId: 'anonymous',
         tier: 'enterprise',
         scopes: ['dns:delete:approve'],
-        livemode: false
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: Math.floor(Date.now() / 1000)
       },
       req.requestId
     );
@@ -723,7 +742,10 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
         tenantId: 'tenant_state_test',
         tier: 'enterprise',
         scopes: ['dns:delete:approve'],
-        livemode: false
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: Math.floor(Date.now() / 1000)
       },
       req.requestId
     );
@@ -779,7 +801,10 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
         tenantId: 'tenant_timeout_test',
         tier: 'enterprise',
         scopes: ['dns:delete:approve'],
-        livemode: false
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: Math.floor(Date.now() / 1000)
       },
       req.requestId
     );
@@ -842,7 +867,10 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
         tenantId: 'tenant_history_test',
         tier: 'enterprise',
         scopes: ['dns:delete:approve'],
-        livemode: false
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: Math.floor(Date.now() / 1000)
       },
       req.requestId
     );
@@ -963,7 +991,7 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     );
     assert.equal(authRes.success, false);
     assert.equal(authRes.status, 403);
-    assert.ok(authRes.error.includes('Service accounts and non-human actors cannot authorize DNS deletions'));
+    assert.ok(authRes.error.includes('human operator with recent MFA verification'));
   });
 
   it('checkDnsDeletionRateLimit bounds requests per tenant and clearTestRegistries resets limits', async () => {
@@ -1006,5 +1034,231 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     const tokenHashes = reloaded.consumedTokens.map((t: any) => t.hash);
     assert.equal(tokenHashes.includes(validHash), true, 'Valid token must be retained');
     assert.equal(tokenHashes.includes(expiredHash), false, 'Expired token hash must be pruned');
+  });
+
+  describe('Unified Human MFA & Security Hardening Suite', () => {
+    it('hasRecentHumanMfa strictly validates human actor, MFA method, and safe recent timestamp', () => {
+      const now = Math.floor(Date.now() / 1000);
+
+      // Valid case: human + MFA + within 5 min
+      assert.equal(hasRecentHumanMfa({
+        actorId: 'usr_h1',
+        tenantId: 'tenant_1',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: now - 120
+      }, now), true);
+
+      // Exactly at 300s boundary: allowed
+      assert.equal(hasRecentHumanMfa({
+        actorId: 'usr_h1',
+        tenantId: 'tenant_1',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['password', 'mfa'],
+        authTime: now - 300
+      }, now), true);
+
+      // Rejection: actorType === 'service'
+      assert.equal(hasRecentHumanMfa({
+        actorId: 'svc_1',
+        tenantId: 'tenant_1',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'service',
+        authMethods: ['mfa'],
+        authTime: now
+      }, now), false);
+
+      // Rejection: missing actorType
+      assert.equal(hasRecentHumanMfa({
+        actorId: 'usr_h1',
+        tenantId: 'tenant_1',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        authMethods: ['mfa'],
+        authTime: now
+      }, now), false);
+
+      // Rejection: human without MFA
+      assert.equal(hasRecentHumanMfa({
+        actorId: 'usr_h1',
+        tenantId: 'tenant_1',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['password'],
+        authTime: now
+      }, now), false);
+
+      // Rejection: authTime > 300 seconds ago (expired session)
+      assert.equal(hasRecentHumanMfa({
+        actorId: 'usr_h1',
+        tenantId: 'tenant_1',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: now - 301
+      }, now), false);
+
+      // Rejection: authTime in future
+      assert.equal(hasRecentHumanMfa({
+        actorId: 'usr_h1',
+        tenantId: 'tenant_1',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: now + 60
+      }, now), false);
+
+      // Rejection: non-safe integer or undefined authTime
+      assert.equal(hasRecentHumanMfa({
+        actorId: 'usr_h1',
+        tenantId: 'tenant_1',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa']
+      }, now), false);
+    });
+
+    it('authorizeDnsDeletionRequest strictly enforces human MFA requirements across all paths', () => {
+      const now = Math.floor(Date.now() / 1000);
+      const req = createDnsDeletionRequest('tenant_mfa_test', 'usr_creator_mfa', 'example.com', 'rec_mfa_1');
+
+      // 1. Rejected if actorType missing
+      const resNoActor = authorizeDnsDeletionRequest({
+        actorId: 'usr_op_1',
+        tenantId: 'tenant_mfa_test',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        authMethods: ['mfa'],
+        authTime: now
+      }, req.requestId);
+      assert.equal(resNoActor.success, false);
+      assert.equal(resNoActor.status, 403);
+      assert.ok(resNoActor.error.includes('human operator with recent MFA'));
+
+      // 2. Rejected if human lacks MFA method
+      const resNoMfa = authorizeDnsDeletionRequest({
+        actorId: 'usr_op_2',
+        tenantId: 'tenant_mfa_test',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['password'],
+        authTime: now
+      }, req.requestId);
+      assert.equal(resNoMfa.success, false);
+      assert.equal(resNoMfa.status, 403);
+
+      // 3. Rejected if authTime > 300s old
+      const resOldAuth = authorizeDnsDeletionRequest({
+        actorId: 'usr_op_3',
+        tenantId: 'tenant_mfa_test',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: now - 305
+      }, req.requestId);
+      assert.equal(resOldAuth.success, false);
+      assert.equal(resOldAuth.status, 403);
+
+      // 4. Allowed when human + MFA + recent authTime
+      const resValid = authorizeDnsDeletionRequest({
+        actorId: 'usr_op_4',
+        tenantId: 'tenant_mfa_test',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: now - 30
+      }, req.requestId);
+      assert.equal(resValid.success, true);
+    });
+
+    it('acquireDnsStateLock fail-closed: throws STALE_DNS_STATE_LOCK when lock is held by dead process', () => {
+      const lockPath = path.join(process.cwd(), '.aeitron-state', 'dns-deletion-state.lock');
+      // Write lockfile referencing a dead PID (e.g. 9999999)
+      fs.writeFileSync(lockPath, JSON.stringify({
+        ownerToken: 'dead-owner-uuid',
+        pid: 9999999,
+        createdAt: Date.now() - 30000
+      }));
+
+      try {
+        assert.throws(() => {
+          withDnsStateLock(() => 'never_reached');
+        }, /STALE_DNS_STATE_LOCK/);
+      } finally {
+        // Clean up test lock
+        try { fs.unlinkSync(lockPath); } catch {}
+      }
+    });
+
+    it('loadOrGenerateRsaKeyPair: strictly throws in hardened environment when neither AEITRON_RSA_PRIVATE_KEY nor AEITRON_RSA_KEY_FILE is configured', () => {
+      const prevEnv = process.env.AEITRON_ENV;
+      const prevKeyFile = process.env.AEITRON_RSA_KEY_FILE;
+      const prevJwtKeyFile = process.env.AEITRON_JWT_KEY_FILE;
+      const prevPriv = process.env.AEITRON_RSA_PRIVATE_KEY;
+      const prevJwtPriv = process.env.AEITRON_JWT_PRIVATE_KEY;
+      const prevPub = process.env.AEITRON_RSA_PUBLIC_KEY;
+      const prevJwtPub = process.env.AEITRON_JWT_PUBLIC_KEY;
+      try {
+        process.env.AEITRON_ENV = 'production';
+        delete process.env.AEITRON_RSA_KEY_FILE;
+        delete process.env.AEITRON_JWT_KEY_FILE;
+        delete process.env.AEITRON_RSA_PRIVATE_KEY;
+        delete process.env.AEITRON_JWT_PRIVATE_KEY;
+        delete process.env.AEITRON_RSA_PUBLIC_KEY;
+        delete process.env.AEITRON_JWT_PUBLIC_KEY;
+
+        assert.throws(() => {
+          loadOrGenerateRsaKeyPair();
+        }, /CRITICAL CONFIGURATION ERROR: AEITRON_RSA_PRIVATE_KEY or AEITRON_RSA_KEY_FILE must be configured in hardened environments/);
+      } finally {
+        if (prevEnv !== undefined) process.env.AEITRON_ENV = prevEnv;
+        else delete process.env.AEITRON_ENV;
+        if (prevKeyFile !== undefined) process.env.AEITRON_RSA_KEY_FILE = prevKeyFile;
+        if (prevJwtKeyFile !== undefined) process.env.AEITRON_JWT_KEY_FILE = prevJwtKeyFile;
+        if (prevPriv !== undefined) process.env.AEITRON_RSA_PRIVATE_KEY = prevPriv;
+        if (prevJwtPriv !== undefined) process.env.AEITRON_JWT_PRIVATE_KEY = prevJwtPriv;
+        if (prevPub !== undefined) process.env.AEITRON_RSA_PUBLIC_KEY = prevPub;
+        if (prevJwtPub !== undefined) process.env.AEITRON_JWT_PUBLIC_KEY = prevJwtPub;
+      }
+    });
+
+    it('checkDnsDeletionRateLimit: fails closed when active buckets reach MAX_DNS_RATE_LIMIT_BUCKETS', () => {
+      _clearDnsDeletionRateLimits();
+      try {
+        for (let i = 0; i < MAX_DNS_RATE_LIMIT_BUCKETS; i++) {
+          const allowed = checkDnsDeletionRateLimit(`tenant_cap_${i}`);
+          assert.equal(allowed, true);
+        }
+        // Next distinct tenant bucket must fail closed to protect memory
+        const overflow = checkDnsDeletionRateLimit('tenant_overflow_blocked');
+        assert.equal(overflow, false, 'Rate limiter must fail closed when capacity cap is reached');
+      } finally {
+        _clearDnsDeletionRateLimits();
+      }
+    });
   });
 });

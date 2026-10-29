@@ -234,7 +234,7 @@ function acquireDnsStateLock(): () => void {
       break;
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code;
-      if (code === 'EEXIST' || code === 'EBUSY') {
+      if (code === 'EEXIST' || code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
         try {
           if (fs.existsSync(lockPath)) {
             let isProcessDead = false;
@@ -257,15 +257,20 @@ function acquireDnsStateLock(): () => void {
               isProcessDead = false;
             }
 
-            // Strictly reclaim only when the holding process is confirmed dead.
-            // Do not delete active locks based solely on elapsed time.
+            // Strictly fail closed when the holding process is confirmed dead.
+            // Automatic unlinking creates race conditions between concurrent contenders.
             if (isProcessDead) {
-              try {
-                fs.unlinkSync(lockPath);
-              } catch {}
+              throw new Error(
+                'STALE_DNS_STATE_LOCK: Lock owner process is no longer running. ' +
+                'Verify all server processes are stopped before manual recovery.'
+              );
             }
           }
-        } catch {}
+        } catch (inspectErr: any) {
+          if (inspectErr?.message?.startsWith('STALE_DNS_STATE_LOCK')) {
+            throw inspectErr;
+          }
+        }
         sleepSync(20);
         continue;
       }
@@ -317,6 +322,15 @@ export function loadOrGenerateRsaKeyPair(): RsaKeyPair {
     throw new Error('CRITICAL CONFIGURATION ERROR: RSA public key is configured without a corresponding private signing key.');
   }
 
+  // Guard: In hardened environments (production/staging), signing keys must be explicitly configured
+  // to guarantee key consistency across multi-replica deployments without shared volumes.
+  const keyFilePath = process.env.AEITRON_RSA_KEY_FILE || process.env.AEITRON_JWT_KEY_FILE;
+  if (isHardenedEnvironment() && !envPrivate && !keyFilePath) {
+    throw new Error(
+      'CRITICAL CONFIGURATION ERROR: AEITRON_RSA_PRIVATE_KEY or AEITRON_RSA_KEY_FILE must be configured in hardened environments (production/staging) to guarantee key consistency across multi-replica deployments.'
+    );
+  }
+
   if (envPrivate) {
     if (envPublic) {
       if (!verifyRsaKeyPairMatch(envPrivate, envPublic)) {
@@ -349,7 +363,6 @@ export function loadOrGenerateRsaKeyPair(): RsaKeyPair {
   }
 
   // 2. Persistent Key File from AEITRON_RSA_KEY_FILE / AEITRON_JWT_KEY_FILE
-  const keyFilePath = process.env.AEITRON_RSA_KEY_FILE || process.env.AEITRON_JWT_KEY_FILE;
   if (keyFilePath) {
     if (!fs.existsSync(keyFilePath)) {
       if (isHardenedEnvironment()) {
@@ -806,23 +819,28 @@ export function registerOAuthClientForTesting(client: OAuthClient): void {
 }
 
 const DNS_DELETION_RATE_LIMITS = new Map<string, { count: number; windowStart: number }>();
+export const MAX_DNS_RATE_LIMIT_BUCKETS = 5000;
 
 /**
  * Tenant-level rate limiter for DNS deletion operations.
- * Protects against deletion flood and resource exhaustion.
+ * Protects against deletion flood and resource exhaustion with a fail-closed hard memory capacity cap.
  */
 export function checkDnsDeletionRateLimit(tenantId: string, limit = 30, windowMs = 60000): boolean {
   const now = Date.now();
   const entry = DNS_DELETION_RATE_LIMITS.get(tenantId);
   if (!entry || now - entry.windowStart >= windowMs) {
-    DNS_DELETION_RATE_LIMITS.set(tenantId, { count: 1, windowStart: now });
-    if (DNS_DELETION_RATE_LIMITS.size > 5000) {
+    if (DNS_DELETION_RATE_LIMITS.size >= MAX_DNS_RATE_LIMIT_BUCKETS) {
       for (const [k, v] of DNS_DELETION_RATE_LIMITS.entries()) {
         if (now - v.windowStart >= windowMs) {
           DNS_DELETION_RATE_LIMITS.delete(k);
         }
       }
     }
+    if (DNS_DELETION_RATE_LIMITS.size >= MAX_DNS_RATE_LIMIT_BUCKETS) {
+      // Memory capacity guard: fail closed if active unexpired buckets reach or exceed cap
+      return false;
+    }
+    DNS_DELETION_RATE_LIMITS.set(tenantId, { count: 1, windowStart: now });
     return true;
   }
   if (entry.count >= limit) {
@@ -830,6 +848,10 @@ export function checkDnsDeletionRateLimit(tenantId: string, limit = 30, windowMs
   }
   entry.count += 1;
   return true;
+}
+
+export function _clearDnsDeletionRateLimits(): void {
+  DNS_DELETION_RATE_LIMITS.clear();
 }
 
 /**
@@ -1419,6 +1441,25 @@ export function createDnsDeletionRequest(
 export const DNS_APPROVAL_SCOPE = 'dns:delete:approve';
 
 /**
+ * Validates that an operator identity represents an authenticated human actor
+ * who completed multi-factor authentication (MFA) within the last 5 minutes (300 seconds).
+ */
+export function hasRecentHumanMfa(
+  claims: AuthClaims,
+  nowSeconds = Math.floor(Date.now() / 1000)
+): boolean {
+  const authTime = claims.authTime;
+  return (
+    claims.actorType === 'human' &&
+    claims.authMethods?.includes('mfa') === true &&
+    typeof authTime === 'number' &&
+    Number.isSafeInteger(authTime) &&
+    authTime <= nowSeconds &&
+    nowSeconds - authTime <= 300
+  );
+}
+
+/**
  * Authorizes a pending deletion request by a verified human operator and issues a single-use token.
  * Enforces independent dual-control: Request creators are strictly prohibited from approving their own requests.
  */
@@ -1447,12 +1488,12 @@ export function authorizeDnsDeletionRequest(
     };
   }
 
-  // 1b. Reject service tokens (machine / bot identity cannot authorize human approval requests)
-  if (operatorClaims.actorType === 'service') {
+  // 1b. Reject any operator that does not satisfy verified human with recent MFA
+  if (!hasRecentHumanMfa(operatorClaims)) {
     return {
       success: false,
       status: 403,
-      error: 'Security Policy Violation: Service accounts and non-human actors cannot authorize DNS deletions.'
+      error: 'Security Policy Violation: DNS deletion approval requires an authenticated human operator with recent MFA verification (within 5 minutes).'
     };
   }
 

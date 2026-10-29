@@ -13,7 +13,7 @@ import {
   getDnsDeletionRequest,
   getPendingDnsDeletionRequest
 } from '../src/auth.js';
-import { handleDnsApproveDeletion } from '../src/cli.js';
+import { handleDnsApproveDeletion, buildApprovalUrl } from '../src/cli.js';
 
 describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
   let client: Client;
@@ -322,7 +322,10 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
         tenantId: 'tenant_customerAcme',
         tier: 'enterprise',
         scopes: ['dns:delete:approve'],
-        livemode: true
+        livemode: true,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: Math.floor(Date.now() / 1000)
       },
       requestId
     );
@@ -458,6 +461,52 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
 
     assert.equal(cliResult.success, false);
     assert.ok(cliResult.error?.includes('Remote approval failed'));
+  });
+
+  it('12f. CLI buildApprovalUrl: strictly validates protocols, redirects, and forbids embedded credentials', () => {
+    // 1. Valid HTTPS remote URL
+    const httpsUrl = buildApprovalUrl('https://api.aeitron.com');
+    assert.equal(httpsUrl.toString(), 'https://api.aeitron.com/v1/dns/approve-deletion');
+
+    // 2. Valid loopback HTTP URLs (localhost, 127.0.0.1, [::1])
+    const loopback1 = buildApprovalUrl('http://localhost:3005');
+    assert.equal(loopback1.toString(), 'http://localhost:3005/v1/dns/approve-deletion');
+    const loopback2 = buildApprovalUrl('http://127.0.0.1:8080');
+    assert.equal(loopback2.toString(), 'http://127.0.0.1:8080/v1/dns/approve-deletion');
+    const loopback3 = buildApprovalUrl('http://[::1]:9000');
+    assert.equal(loopback3.toString(), 'http://[::1]:9000/v1/dns/approve-deletion');
+
+    // 3. Insecure remote HTTP -> strictly throws
+    assert.throws(
+      () => buildApprovalUrl('http://remote.aeitron.internal:8080'),
+      /Insecure HTTP is only permitted for loopback addresses/
+    );
+
+    // 4. Embedded credentials in URL -> strictly throws
+    assert.throws(
+      () => buildApprovalUrl('https://admin:secret@api.aeitron.com'),
+      /must not contain embedded user credentials/
+    );
+
+    // 5. Query parameters or hash fragments in base URL -> strictly throws
+    assert.throws(
+      () => buildApprovalUrl('https://api.aeitron.com?param=bad'),
+      /must not contain query parameters or fragments/
+    );
+    assert.throws(
+      () => buildApprovalUrl('https://api.aeitron.com#fragment'),
+      /must not contain query parameters or fragments/
+    );
+
+    // 6. Invalid protocols
+    assert.throws(
+      () => buildApprovalUrl('ftp://api.aeitron.com'),
+      /Only HTTPS \(or loopback HTTP\) is supported/
+    );
+    assert.throws(
+      () => buildApprovalUrl('not-a-valid-url'),
+      /Invalid base URL/
+    );
   });
 
   it('13. delete_dns_record: rejects invalid or forged approvalToken with 403 Forbidden', async () => {

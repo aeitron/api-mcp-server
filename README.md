@@ -99,6 +99,28 @@ npm run serve
 
 ---
 
+## Docker Deployment & Production State Persistence
+
+When deploying via Docker in production or multi-replica environments:
+
+### 1. Persistent Storage Volume
+Mount a dedicated volume for the server state directory (`/app/.aeitron-state`) to ensure persistent tracking of DNS deletion requests, lockfiles, and audit integrity:
+```bash
+docker run -d \
+  -p 3005:3005 \
+  --name aeitron-mcp \
+  --mount source=aeitron-mcp-state,target=/app/.aeitron-state \
+  -e AEITRON_ENV=production \
+  -e AEITRON_JWT_SECRET="<production-hmac-secret-min-32-chars>" \
+  -e AEITRON_RSA_PRIVATE_KEY="<production-pem-private-key>" \
+  aeitron-mcp-server:latest
+```
+
+### 2. Multi-Replica Signing Key Consistency
+In multi-replica Kubernetes or container clusters, each replica must share the same asymmetric key pair. Set `AEITRON_RSA_PRIVATE_KEY` (or `AEITRON_RSA_KEY_FILE`) across all pods or replicas. In hardened environments (`production`/`staging`), the server fails closed on startup if shared signing keys are missing, preventing cross-replica challenge token invalidation.
+
+---
+
 ## Local Development & Testing
 
 ```bash
