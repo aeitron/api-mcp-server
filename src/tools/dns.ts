@@ -1,13 +1,19 @@
 /**
  * Aeitron MCP Tool — DNS Zone Management (get_dns_records, create_dns_record, delete_dns_record)
- * Enforces strict tool-level scope authorization and fail-closed safety confirmation with dry-run support.
+ * Enforces strict tool-level scope authorization, fail-closed safety confirmation,
+ * dry-run support, and cryptographic human operator challenge verification.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { AeitronApiClient } from '../client.js';
 import { AuditLogger } from '../audit.js';
-import { AuthClaims, checkToolAuthorization } from '../auth.js';
+import {
+  AuthClaims,
+  checkToolAuthorization,
+  issueDnsDeletionChallenge,
+  verifyDnsDeletionChallenge
+} from '../auth.js';
 
 export function registerDnsTools(
   server: McpServer,
@@ -50,33 +56,25 @@ export function registerDnsTools(
           actorId: authClaims?.actorId
         });
 
-        if (records.length === 0) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `No DNS records found for domain '${args.domain}'.`
-              }
-            ]
-          };
-        }
-
-        const tableHeader = '| Type | Name | Target / Value | TTL | Proxied | Status |\n|---|---|---|---|---|---|';
-        const tableRows = records.map(
-          r => `| \`${r.type}\` | \`${r.name}\` | \`${r.value}\` | ${r.ttl}s | ${r.proxied ? '✓ Yes' : 'No'} | \`${r.status}\` |`
+        const rows = records.map(
+          (r) => `| \`${r.type}\` | \`${r.name}\` | \`${r.value}\` | ${r.ttl}s | ${r.proxied ? '✓ Edge Proxied' : 'DNS Only'} | \`${r.id}\` |`
         );
 
-        const summaryText = [
-          `### DNS Records for \`${args.domain}\` (${records.length} records)`,
-          tableHeader,
-          ...tableRows
+        const markdownTable = [
+          `### DNS Records for \`${args.domain}\` 🌐`,
+          ``,
+          `| Type | Name | Target / Value | TTL | Proxy Status | Record ID |`,
+          `| :--- | :--- | :--- | :--- | :--- | :--- |`,
+          ...rows,
+          ``,
+          `*Total active records: ${records.length}*`
         ].join('\n');
 
         return {
           content: [
             {
               type: 'text',
-              text: summaryText
+              text: markdownTable
             },
             {
               type: 'text',
@@ -204,10 +202,10 @@ export function registerDnsTools(
     }
   );
 
-  // 3. delete_dns_record (Scope: dns:write:delete - High-Risk Write with Safety Confirmation & Dry Run)
+  // 3. delete_dns_record (Scope: dns:write:delete - High-Risk Write with Safety Confirmation, Dry Run & Two-Step Challenge)
   server.tool(
     'delete_dns_record',
-    'Permanently delete a DNS record from the domain zone. Requires scope dns:write:delete and explicit confirmation.',
+    'Permanently delete a DNS record from the domain zone. Requires scope dns:write:delete, explicit human operator confirmation, and valid cryptographic challenge approval token.',
     {
       domain: z
         .string()
@@ -224,7 +222,11 @@ export function registerDnsTools(
       dryRun: z
         .boolean()
         .default(false)
-        .describe('Dry Run: If true, returns an impact preview without performing the actual deletion.')
+        .describe('Dry Run: If true, returns an impact preview and challenge token without performing deletion.'),
+      approvalToken: z
+        .string()
+        .optional()
+        .describe('Cryptographic approval challenge token issued by the server. Required to prevent AI prompt self-approval.')
     },
     async (args) => {
       // 1. Enforce high-risk delete scope
@@ -240,8 +242,11 @@ export function registerDnsTools(
         };
       }
 
+      const tenantId = authClaims?.tenantId || 'anonymous';
+
       // 2. Handle Dry Run Preview
       if (args.dryRun === true) {
+        const challenge = issueDnsDeletionChallenge(tenantId, args.domain, args.recordId);
         audit.logToolExecution('delete_dns_record_preview', args, 0, true, {
           tenantId: authClaims?.tenantId,
           actorId: authClaims?.actorId
@@ -254,15 +259,62 @@ export function registerDnsTools(
                 `### ⚠️ DRY RUN PREVIEW: DNS Record Deletion`,
                 `- **Domain Zone:** \`${args.domain}\``,
                 `- **Target Record ID:** \`${args.recordId}\``,
-                `- **Impact:** Deleting this record will stop resolving DNS traffic for this name immediately.`,
-                `- **Action Required:** To execute the permanent deletion, invoke \`delete_dns_record\` with \`confirm: true\` and \`dryRun: false\`.`
+                `- **Impact:** Deleting this record will stop resolving live traffic for this DNS name.`,
+                `- **Operator Approval Token:** \`${challenge.token}\``,
+                `- **Expires:** In 5 minutes (${new Date(challenge.expiresAt).toISOString()})`,
+                `- **Action Required:** To execute, human operator must approve and re-invoke delete_dns_record with \`approvalToken: "${challenge.token}"\`, \`confirm: true\`, and \`dryRun: false\`.`
               ].join('\n')
             }
           ]
         };
       }
 
-      // 3. Guarded Safety Check: Fail closed if confirm is not explicitly true
+      // 3. Challenge Guard: Reject if no approval token is provided (prevents LLM self-authorization)
+      if (!args.approvalToken) {
+        const challenge = issueDnsDeletionChallenge(tenantId, args.domain, args.recordId);
+        audit.logToolExecution('delete_dns_record', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, 'Human operator challenge token required');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: [
+                `⚠️ SAFETY GUARD: Deleting a DNS record is a destructive action that can disrupt live production traffic.`,
+                `To prevent unintended LLM self-authorization, an explicit human approval challenge is required.`,
+                ``,
+                `Please ask the human user to confirm the deletion. Once confirmed, re-invoke this tool with:`,
+                `- \`approvalToken\`: \`${challenge.token}\``,
+                `- \`confirm\`: \`true\``,
+                `- \`dryRun\`: \`false\``,
+                `*(Token expires in 5 minutes)*`
+              ].join('\n')
+            }
+          ]
+        };
+      }
+
+      // 4. Verify Cryptographic Challenge Approval Token
+      const tokenVerification = verifyDnsDeletionChallenge(args.approvalToken, tenantId, args.domain, args.recordId);
+      if (!tokenVerification.valid) {
+        audit.logToolExecution('delete_dns_record', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, `Invalid approval token: ${tokenVerification.error}`);
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `403 Forbidden: Invalid or expired deletion approval token: ${tokenVerification.error}`
+            }
+          ]
+        };
+      }
+
+      // 5. Explicit Confirmation Boolean Check
       if (args.confirm !== true) {
         audit.logToolExecution('delete_dns_record', args, 0, false, {
           tenantId: authClaims?.tenantId,
@@ -273,13 +325,13 @@ export function registerDnsTools(
           content: [
             {
               type: 'text',
-              text: `⚠️ SAFETY GUARD: Deleting a DNS record is a destructive action that can disrupt live production traffic. To proceed, please ask the user for confirmation and invoke this tool with confirm: true and dryRun: false.`
+              text: `⚠️ SAFETY GUARD: Valid approval token provided, but "confirm" argument must also be explicitly true to execute deletion.`
             }
           ]
         };
       }
 
-      // 4. Perform Permanent Deletion
+      // 6. Perform Permanent Deletion
       const startTime = Date.now();
       try {
         const result = await client.deleteDnsRecord(args);

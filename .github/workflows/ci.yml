@@ -27,7 +27,7 @@ jobs:
       - name: Build TypeScript
         run: npm run build
 
-      - name: Run Test Suite (27 passing tests)
+      - name: Run Complete Test Suite (47 passing tests)
         run: npm test
 
       - name: Verify OpenAPI Contract
@@ -35,3 +35,4 @@ jobs:
 
       - name: Verify Docker Container Build
         run: docker build -t aeitron-mcp-server:ci .
+

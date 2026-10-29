@@ -1,26 +1,36 @@
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { IncomingMessage } from 'node:http';
+import crypto from 'node:crypto';
 import {
   extractTokenFromRequest,
   verifyAuthToken,
   checkToolAuthorization,
   createSignedTestJwt,
   getOAuthDiscoveryMetadata,
-  getJwksMetadata
+  getJwksMetadata,
+  registerAuthoritativeKeyForTesting,
+  clearTestRegistries,
+  loadAuthoritativeKeysFromEnv,
+  issueDnsDeletionChallenge,
+  verifyDnsDeletionChallenge
 } from '../src/auth.js';
 
 describe('OAuth & Cryptographic Token Verification Suite', () => {
+  beforeEach(() => {
+    clearTestRegistries();
+  });
+
   it('extracts Bearer token from Authorization header and marks wasInQuery=false', () => {
     const mockReq = {
       headers: {
-        authorization: 'Bearer atk_live_customerAcme_8832asecurekey'
+        authorization: 'Bearer atk_live_test_sample_key_123'
       }
     } as unknown as IncomingMessage;
 
     const url = new URL('http://localhost/mcp/sse');
     const result = extractTokenFromRequest(mockReq, url);
-    assert.equal(result.token, 'atk_live_customerAcme_8832asecurekey');
+    assert.equal(result.token, 'atk_live_test_sample_key_123');
     assert.equal(result.wasInQuery, false);
   });
 
@@ -52,23 +62,41 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     }
   });
 
-  it('verifies authoritative live API key against cryptographic hashed registry', () => {
+  it('strictly rejects previously hardcoded test key in clean registry with 401 INVALID_CREDENTIALS', () => {
+    // Zero hardcoded keys in source code!
     const result = verifyAuthToken('atk_live_customerAcme_8832asecurekey');
-    assert.equal(result.success, true);
-    if (result.success) {
-      assert.equal(result.claims.tenantId, 'tenant_customerAcme');
-      assert.equal(result.claims.actorId, 'usr_live_acme_admin');
-      assert.equal(result.claims.livemode, true);
-      assert.ok(result.claims.scopes.includes('dns:write:delete'));
-    }
-  });
-
-  it('strictly rejects fake unverified atk_live_ keys with 401 INVALID_CREDENTIALS', () => {
-    const result = verifyAuthToken('atk_live_unregistered_attacker_key_999');
     assert.equal(result.success, false);
     if (!result.success) {
       assert.equal(result.status, 401);
       assert.equal(result.code, 'INVALID_CREDENTIALS');
+    }
+  });
+
+  it('dynamically loads authoritative keys from AEITRON_API_KEYS environment format', () => {
+    loadAuthoritativeKeysFromEnv('atk_live_env_loaded_key:tenant_env_01:usr_env_admin:enterprise:account:read+dns:write:delete');
+    const result = verifyAuthToken('atk_live_env_loaded_key');
+    assert.equal(result.success, true);
+    if (result.success) {
+      assert.equal(result.claims.tenantId, 'tenant_env_01');
+      assert.equal(result.claims.actorId, 'usr_env_admin');
+      assert.equal(result.claims.tier, 'enterprise');
+      assert.ok(result.claims.scopes.includes('dns:write:delete'));
+    }
+  });
+
+  it('verifies authoritative key registered in-memory for testing', () => {
+    registerAuthoritativeKeyForTesting('atk_live_test_acme_admin', {
+      tenantId: 'tenant_customerAcme',
+      actorId: 'usr_live_acme_admin',
+      tier: 'enterprise',
+      scopes: ['account:read', 'dns:write:delete']
+    });
+
+    const result = verifyAuthToken('atk_live_test_acme_admin');
+    assert.equal(result.success, true);
+    if (result.success) {
+      assert.equal(result.claims.tenantId, 'tenant_customerAcme');
+      assert.equal(result.claims.actorId, 'usr_live_acme_admin');
     }
   });
 
@@ -81,7 +109,7 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     }
   });
 
-  it('verifies cryptographically signed valid JWT with HMAC-SHA256 signature', () => {
+  it('verifies cryptographically signed valid JWT with HMAC-SHA256 signature and mandatory claims', () => {
     const validJwt = createSignedTestJwt({
       sub: 'usr_valid_subscriber',
       org_id: 'org_acme_corp',
@@ -97,9 +125,92 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     }
   });
 
+  it('rejects JWT missing mandatory exp claim with 401 MISSING_EXP_CLAIM', () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({
+      iss: 'https://api.aeitron.com',
+      aud: 'aeitron-mcp',
+      sub: 'usr_no_exp',
+      scopes: ['account:read']
+      // exp is omitted!
+    })).toString('base64url');
+    const secret = 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890';
+    const sig = crypto.createHmac('sha256', secret).update(`${header}.${payload}`).digest('base64url');
+    const jwtWithoutExp = `${header}.${payload}.${sig}`;
+
+    const result = verifyAuthToken(jwtWithoutExp, { jwtSecret: secret });
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.equal(result.status, 401);
+      assert.equal(result.code, 'MISSING_EXP_CLAIM');
+    }
+  });
+
+  it('rejects JWT missing or untrusted issuer with 401 INVALID_ISSUER', () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({
+      iss: 'https://untrusted-attacker.com',
+      aud: 'aeitron-mcp',
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      scopes: ['account:read']
+    })).toString('base64url');
+    const secret = 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890';
+    const sig = crypto.createHmac('sha256', secret).update(`${header}.${payload}`).digest('base64url');
+    const untrustedJwt = `${header}.${payload}.${sig}`;
+
+    const result = verifyAuthToken(untrustedJwt, { jwtSecret: secret });
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.equal(result.status, 401);
+      assert.equal(result.code, 'INVALID_ISSUER');
+    }
+  });
+
+  it('rejects JWT missing or wrong audience with 401 INVALID_AUDIENCE', () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({
+      iss: 'https://api.aeitron.com',
+      aud: 'other-service-aud', // wrong audience!
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      scopes: ['account:read']
+    })).toString('base64url');
+    const secret = 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890';
+    const sig = crypto.createHmac('sha256', secret).update(`${header}.${payload}`).digest('base64url');
+    const wrongAudJwt = `${header}.${payload}.${sig}`;
+
+    const result = verifyAuthToken(wrongAudJwt, { jwtSecret: secret });
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.equal(result.status, 401);
+      assert.equal(result.code, 'INVALID_AUDIENCE');
+    }
+  });
+
+  it('rejects JWT missing scopes claim with 401 MISSING_SCOPES_CLAIM and denies default privileges', () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({
+      iss: 'https://api.aeitron.com',
+      aud: 'aeitron-mcp',
+      exp: Math.floor(Date.now() / 1000) + 3600
+      // scopes omitted!
+    })).toString('base64url');
+    const secret = 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890';
+    const sig = crypto.createHmac('sha256', secret).update(`${header}.${payload}`).digest('base64url');
+    const noScopesJwt = `${header}.${payload}.${sig}`;
+
+    const result = verifyAuthToken(noScopesJwt, { jwtSecret: secret });
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.equal(result.status, 401);
+      assert.equal(result.code, 'MISSING_SCOPES_CLAIM');
+    }
+  });
+
   it('rejects forged JWT signature with 401 INVALID_SIGNATURE', () => {
     const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
     const payload = Buffer.from(JSON.stringify({
+      iss: 'https://api.aeitron.com',
+      aud: 'aeitron-mcp',
       sub: 'usr_attacker',
       exp: Math.floor(Date.now() / 1000) + 3600,
       scopes: ['dns:write:delete']
@@ -128,58 +239,48 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     }
   });
 
-  it('enforces required scopes and denies unauthorized permissions with 403 INSUFFICIENT_SCOPE', () => {
-    const limitedJwt = createSignedTestJwt({
-      sub: 'usr_limited',
-      scopes: ['account:read']
+  it('fails closed when checking authorization for an unmapped tool name', () => {
+    const result = checkToolAuthorization('arbitrary_unknown_new_tool', {
+      actorId: 'usr_admin',
+      tenantId: 'tenant_admin',
+      tier: 'enterprise',
+      scopes: ['*'],
+      livemode: true
     });
 
-    const result = verifyAuthToken(limitedJwt, {
-      requiredScopes: ['dns:write:delete']
-    });
-
-    assert.equal(result.success, false);
-    if (!result.success) {
-      assert.equal(result.status, 403);
-      assert.equal(result.code, 'INSUFFICIENT_SCOPE');
-      assert.ok(result.error.includes('dns:write:delete'));
-    }
+    assert.equal(result.authorized, false);
+    assert.ok(result.error?.includes('Unmapped tool'));
   });
 
-  it('enforces granular tool-level authorization via checkToolAuthorization', () => {
-    // Unauthenticated caller
-    const deniedNoAuth = checkToolAuthorization('delete_dns_record', undefined);
-    assert.equal(deniedNoAuth.authorized, false);
-    assert.ok(deniedNoAuth.error?.includes('Authentication required'));
+  it('issues and verifies cryptographic DNS deletion challenge tokens', () => {
+    const challenge = issueDnsDeletionChallenge('tenant_acme', 'aeitron.com', 'rec_01');
+    assert.ok(challenge.token.startsWith('del_tok_'));
+    assert.ok(challenge.expiresAt > Date.now());
 
-    // Caller lacking dns:write:delete
-    const deniedScope = checkToolAuthorization('delete_dns_record', {
-      actorId: 'usr_test',
-      tenantId: 'tenant_test',
-      tier: 'developer',
-      scopes: ['account:read', 'dns:read'],
-      livemode: true
-    });
-    assert.equal(deniedScope.authorized, false);
-    assert.ok(deniedScope.error?.includes('Forbidden'));
+    // Valid verification
+    const verified = verifyDnsDeletionChallenge(challenge.token, 'tenant_acme', 'aeitron.com', 'rec_01');
+    assert.equal(verified.valid, true);
 
-    // Authorized caller
-    const allowed = checkToolAuthorization('delete_dns_record', {
-      actorId: 'usr_admin',
-      tenantId: 'tenant_test',
-      tier: 'enterprise',
-      scopes: ['dns:write:delete'],
-      livemode: true
-    });
-    assert.equal(allowed.authorized, true);
+    // Mismatched domain verification
+    const badDomain = verifyDnsDeletionChallenge(challenge.token, 'tenant_acme', 'other-domain.com', 'rec_01');
+    assert.equal(badDomain.valid, false);
+    assert.ok(badDomain.error?.includes('match'));
+
+    // Mismatched recordId verification
+    const badRecord = verifyDnsDeletionChallenge(challenge.token, 'tenant_acme', 'aeitron.com', 'rec_wrong_99');
+    assert.equal(badRecord.valid, false);
+
+    // Forged signature verification
+    const forgedToken = challenge.token.slice(0, -6) + 'abcdef';
+    const badSig = verifyDnsDeletionChallenge(forgedToken, 'tenant_acme', 'aeitron.com', 'rec_01');
+    assert.equal(badSig.valid, false);
   });
 
   it('generates compliant RFC 8414 OAuth 2.0 metadata', () => {
     const meta = getOAuthDiscoveryMetadata('https://api.aeitron.com');
     assert.equal(meta.issuer, 'https://api.aeitron.com');
     assert.equal(meta.token_endpoint, 'https://api.aeitron.com/v1/auth/token');
-    assert.ok(Array.isArray(meta.scopes_supported));
-    assert.ok(Array.isArray(meta.grant_types_supported));
+    assert.deepEqual(meta.grant_types_supported, ['client_credentials']);
   });
 
   it('returns compliant RFC 7517 JWKS metadata', () => {

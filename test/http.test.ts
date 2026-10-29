@@ -4,7 +4,7 @@ import { createMcpHttpServer, McpHttpServerInstance } from '../src/http.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 
-describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
+describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
   let serverInstance: McpHttpServerInstance;
   let baseUrl: string;
 
@@ -28,7 +28,7 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     await serverInstance.close();
   });
 
-  it('1. GET /health: returns service status and active session counts', async () => {
+  it('1. GET /health: returns service status, transports, and active session counts', async () => {
     const res = await fetch(`${baseUrl}/health`);
     assert.equal(res.status, 200);
     const body = await res.json() as { status: string; service: string; activeSessions: number };
@@ -37,20 +37,22 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     assert.equal(typeof body.activeSessions, 'number');
   });
 
-  it('2. GET /ready: returns readiness probe and supported transports', async () => {
+  it('2. GET /ready: returns readiness probe including modern streamable-http transport', async () => {
     const res = await fetch(`${baseUrl}/ready`);
     assert.equal(res.status, 200);
     const body = await res.json() as { ready: boolean; supportedTransports: string[] };
     assert.equal(body.ready, true);
+    assert.ok(body.supportedTransports.includes('streamable-http'));
     assert.ok(body.supportedTransports.includes('sse'));
   });
 
-  it('3. GET /.well-known/oauth-authorization-server: returns OAuth metadata', async () => {
+  it('3. GET /.well-known/oauth-authorization-server: returns OAuth metadata with client_credentials', async () => {
     const res = await fetch(`${baseUrl}/.well-known/oauth-authorization-server`);
     assert.equal(res.status, 200);
-    const meta = await res.json() as { token_endpoint: string; scopes_supported: string[] };
+    const meta = await res.json() as { token_endpoint: string; scopes_supported: string[]; grant_types_supported: string[] };
     assert.ok(meta.token_endpoint.includes('/v1/auth/token'));
     assert.ok(meta.scopes_supported.includes('dns:read'));
+    assert.deepEqual(meta.grant_types_supported, ['client_credentials']);
   });
 
   it('4. GET /.well-known/jwks.json: returns compliant JWKS public key metadata', async () => {
@@ -61,13 +63,43 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     assert.equal(body.keys[0].alg, 'HS256');
   });
 
-  it('5. POST /v1/auth/token: performs client credentials token exchange', async () => {
+  it('5. POST /v1/auth/token: strictly rejects unauthenticated callers with 401 invalid_client', async () => {
+    const res = await fetch(`${baseUrl}/v1/auth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'client_credentials'
+        // Missing client_id and client_secret!
+      })
+    });
+    assert.equal(res.status, 401);
+    const body = await res.json() as { error: string };
+    assert.equal(body.error, 'invalid_client');
+  });
+
+  it('6. POST /v1/auth/token: rejects invalid client_secret with 401 unauthorized_client', async () => {
     const res = await fetch(`${baseUrl}/v1/auth/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         grant_type: 'client_credentials',
-        client_id: 'client_app_123'
+        client_id: 'aeitron_test_client_id',
+        client_secret: 'wrong_unauthorized_secret'
+      })
+    });
+    assert.equal(res.status, 401);
+    const body = await res.json() as { error: string };
+    assert.equal(body.error, 'unauthorized_client');
+  });
+
+  it('7. POST /v1/auth/token: authenticates valid client credentials and issues signed JWT', async () => {
+    const res = await fetch(`${baseUrl}/v1/auth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'client_credentials',
+        client_id: 'aeitron_test_client_id',
+        client_secret: 'secret_test_key_889'
       })
     });
     assert.equal(res.status, 200);
@@ -77,7 +109,32 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     assert.equal(body.expires_in, 3600);
   });
 
-  it('6. Security Gate: rejects unauthenticated SSE connection with 401 Unauthorized', async () => {
+  it('8. CORS Preflight: handles OPTIONS requests on /mcp/sse and sets standard CORS headers', async () => {
+    const res = await fetch(`${baseUrl}/mcp/sse`, {
+      method: 'OPTIONS',
+      headers: {
+        'Origin': 'https://chatgpt.com',
+        'Access-Control-Request-Method': 'GET'
+      }
+    });
+    assert.equal(res.status, 204);
+    assert.ok(res.headers.get('access-control-allow-origin'));
+    assert.ok(res.headers.get('access-control-allow-methods'));
+  });
+
+  it('9. CORS Preflight: handles OPTIONS requests on /mcp', async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: 'OPTIONS',
+      headers: {
+        'Origin': 'https://claude.ai',
+        'Access-Control-Request-Method': 'POST'
+      }
+    });
+    assert.equal(res.status, 204);
+    assert.ok(res.headers.get('access-control-allow-origin'));
+  });
+
+  it('10. Security Gate: rejects unauthenticated SSE connection with 401 Unauthorized', async () => {
     const res = await fetch(`${baseUrl}/mcp/sse`);
     assert.equal(res.status, 401);
     const problem = await res.json() as { type: string; status: number };
@@ -85,8 +142,7 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     assert.ok(problem.type.includes('unauthorized'));
   });
 
-  it('7. Remote MCP over SSE: connects client, discovers tools, and calls tool successfully', async () => {
-    // Authenticate via query param (standard browser EventSource pattern)
+  it('11. Remote MCP over SSE: connects client, discovers tools, and calls tool successfully', async () => {
     const sseUrl = new URL(`${baseUrl}/mcp/sse?token=atk_sandbox_live_e2e_test`);
     const transport = new SSEClientTransport(sseUrl);
 
@@ -97,13 +153,11 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
 
     await client.connect(transport);
 
-    // Verify tool discovery
     const toolList = await client.listTools();
     const names = toolList.tools.map((t) => t.name);
     assert.ok(names.includes('get_account'));
     assert.ok(names.includes('get_dns_records'));
 
-    // Verify calling get_account over remote SSE
     const result = await client.callTool({
       name: 'get_account',
       arguments: {}
@@ -113,13 +167,11 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     const content = result.content as Array<{ text: string }>;
     assert.ok(content[0].text.includes('Aeitron Account Overview'));
 
-    // Verify session was registered in active sessions map
     assert.equal(serverInstance.activeSessions.size, 1);
-
     await client.close();
   });
 
-  it('8. POST /mcp/messages: rejects unknown or expired session IDs with 404', async () => {
+  it('12. POST /mcp/messages: rejects unknown or expired session IDs with 404', async () => {
     const res = await fetch(`${baseUrl}/mcp/messages?sessionId=non_existent_session_id`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

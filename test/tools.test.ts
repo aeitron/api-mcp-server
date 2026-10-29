@@ -5,6 +5,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { createAeitronMcpServer } from '../src/server.js';
 import { AuditLogger } from '../src/audit.js';
 import { AuditRecord } from '../src/types.js';
+import { issueDnsDeletionChallenge } from '../src/auth.js';
 
 describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
   let client: Client;
@@ -90,7 +91,6 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     assert.equal(parsed.limits.maxProjects, 25);
     assert.equal(parsed.limits.maxDomains, 100);
 
-    // Verify audit record was created
     const log = auditLogs.find((l) => l.tool === 'get_account');
     assert.ok(log, 'Audit record for get_account must exist');
     assert.equal(log?.success, true);
@@ -222,22 +222,23 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     assert.equal(json.value, '198.51.100.55');
   });
 
-  it('10. delete_dns_record Safety Guard: fails closed if confirm is false', async () => {
+  it('10. delete_dns_record Challenge Guard: fails closed with operator challenge token when approvalToken is missing', async () => {
     const result = await client.callTool({
       name: 'delete_dns_record',
       arguments: {
         domain: 'aeitron.com',
         recordId: 'rec_dns_cname_003',
-        confirm: false
+        confirm: true // confirm without token must fail closed!
       }
     });
 
     assert.equal(result.isError, true);
     const content = result.content as Array<{ text: string }>;
     assert.ok(content[0].text.includes('SAFETY GUARD'));
+    assert.ok(content[0].text.includes('del_tok_'));
   });
 
-  it('11. delete_dns_record Dry Run: returns safe impact preview without mutating DNS', async () => {
+  it('11. delete_dns_record Dry Run: returns safe impact preview with challenge token without mutating DNS', async () => {
     const result = await client.callTool({
       name: 'delete_dns_record',
       arguments: {
@@ -251,15 +252,19 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     const content = result.content as Array<{ text: string }>;
     assert.ok(content[0].text.includes('DRY RUN PREVIEW'));
     assert.ok(content[0].text.includes('rec_dns_cname_003'));
+    assert.ok(content[0].text.includes('del_tok_'));
   });
 
-  it('12. delete_dns_record: executes permanent deletion when confirm is true', async () => {
+  it('12. delete_dns_record: executes permanent deletion when valid approvalToken and confirm are provided', async () => {
+    const challenge = issueDnsDeletionChallenge('tenant_customerAcme', 'aeitron.com', 'rec_dns_cname_003');
+
     const result = await client.callTool({
       name: 'delete_dns_record',
       arguments: {
         domain: 'aeitron.com',
         recordId: 'rec_dns_cname_003',
-        confirm: true
+        confirm: true,
+        approvalToken: challenge.token
       }
     });
 
@@ -270,7 +275,23 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     assert.equal(json.success, true);
   });
 
-  it('13. Scope Enforcement Gate: denies tools when caller lacks required permission scope', async () => {
+  it('13. delete_dns_record: rejects invalid or forged approvalToken with 403 Forbidden', async () => {
+    const result = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_003',
+        confirm: true,
+        approvalToken: 'del_tok_forged_payload.bad_sig'
+      }
+    });
+
+    assert.equal(result.isError, true);
+    const content = result.content as Array<{ text: string }>;
+    assert.ok(content[0].text.includes('403 Forbidden'));
+  });
+
+  it('14. Scope Enforcement Gate: denies tools when caller lacks required permission scope', async () => {
     const readOnlyServer = createAeitronMcpServer({
       authClaims: {
         tenantId: 'tenant_readonly',

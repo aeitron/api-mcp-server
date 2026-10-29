@@ -1,25 +1,40 @@
 /**
  * Aeitron MCP Server — Hardened Configuration & Environment Parser
  * Enforces fail-closed production boundaries: zero mock fallback in production,
- * required cryptographic secrets, and explicit CORS origin policies.
+ * required cryptographic secrets, strict environment parsing, and explicit CORS origin policies.
  */
 
 export interface McpServerConfig {
   apiBaseUrl: string;
   defaultApiKey?: string;
-  environment: 'development' | 'staging' | 'production';
+  environment: 'development' | 'staging' | 'production' | 'test';
   mockFallback: boolean;
   requestTimeoutMs: number;
   jwtSecret: string;
   corsAllowedOrigins: string[];
   allowSandbox: boolean;
+  rawApiKeys?: string;
+  rawOAuthClients?: string;
 }
 
 export function getConfig(): McpServerConfig {
-  const env = (process.env.AEITRON_ENV || 'development').toLowerCase();
-  const isProd = env === 'production';
-  const environment: 'development' | 'staging' | 'production' =
-    env === 'production' ? 'production' : env === 'staging' ? 'staging' : 'development';
+  const rawEnv = (process.env.AEITRON_ENV || 'development').trim().toLowerCase();
+  
+  let environment: 'development' | 'staging' | 'production' | 'test';
+  if (rawEnv === 'production' || rawEnv === 'prod') {
+    environment = 'production';
+  } else if (rawEnv === 'staging' || rawEnv === 'stage') {
+    environment = 'staging';
+  } else if (rawEnv === 'development' || rawEnv === 'dev') {
+    environment = 'development';
+  } else if (rawEnv === 'test') {
+    environment = 'test';
+  } else {
+    // Fail-Closed: Unrecognized environment must not default to development
+    throw new Error(`FATAL CONFIGURATION ERROR: Invalid AEITRON_ENV '${rawEnv}'. Permitted environments: development, staging, production, test.`);
+  }
+
+  const isProd = environment === 'production';
 
   // 1. Strict Fail-Closed Mock Fallback Guard
   const explicitMock = process.env.AEITRON_MOCK_FALLBACK;
@@ -42,7 +57,7 @@ export function getConfig(): McpServerConfig {
     ? ['https://chatgpt.com', 'https://claude.ai', 'https://console.aeitron.com', 'https://api.aeitron.com']
     : ['*'];
 
-  // 4. Sandbox Credentials Allowed
+  // 4. Sandbox Credentials Allowed (Only in non-production)
   const allowSandbox = !isProd && process.env.AEITRON_ALLOW_SANDBOX !== 'false';
 
   return {
@@ -53,6 +68,8 @@ export function getConfig(): McpServerConfig {
     requestTimeoutMs: parseInt(process.env.AEITRON_REQUEST_TIMEOUT_MS || '8000', 10),
     jwtSecret,
     corsAllowedOrigins,
-    allowSandbox
+    allowSandbox,
+    rawApiKeys: process.env.AEITRON_API_KEYS,
+    rawOAuthClients: process.env.AEITRON_OAUTH_CLIENTS
   };
 }

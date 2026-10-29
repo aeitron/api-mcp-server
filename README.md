@@ -22,22 +22,26 @@ The MCP server exposes strictly-typed, schema-validated tools governed by server
 | `get_usage` | `usage:read` | Read | Summarizes bandwidth, edge request counts, microVM compute hours, and estimated billing costs. |
 | `create_project` | `projects:write` | Write | Provisions a new project workspace on the Aeitron edge network. |
 | `create_dns_record` | `dns:write` | Write | Adds a new DNS routing record to an authorized domain zone. |
-| `delete_dns_record` | `dns:write:delete` | High-Risk Write | Permanently deletes a DNS record from the domain zone (Requires explicit `confirm: true` safety guard). |
+| `delete_dns_record` | `dns:write:delete` | High-Risk Write | Permanently deletes a DNS record. Requires scope `dns:write:delete`, explicit `confirm: true`, and server-issued cryptographic `approvalToken`. |
 
 ---
 
 ## Security Architecture
 
-- **Zero Direct Database Access:** The MCP server never connects to internal databases or executes shell commands. All operations are dispatched through the edge API Gateway.
-- **Credential Redaction:** Sensitive tokens, passwords, private keys, and authorization headers are deeply sanitized before being logged or returned to the LLM context.
-- **Tenant Isolation:** The tenant context is strictly extracted from server-validated Bearer credentials; clients cannot impersonate other tenants.
-- **Audit Trails:** Structured single-line JSON logs are emitted for every tool invocation.
+- **Zero Hardcoded Credentials:** Zero live API keys in source code. Production credentials are dynamically loaded from `AEITRON_API_KEYS` and verified via SHA-256 hashes.
+- **Fail-Closed Mandatory JWT Claims:** All JWTs must include valid numeric `exp` (expiration), trusted `iss` (`https://api.aeitron.com`), verified `aud` (`aeitron-mcp`), and explicit `scopes`. Missing claims or signatures reject with 401 Unauthorized.
+- **Authenticated OAuth Token Exchange:** `POST /v1/auth/token` enforces real client authentication (client ID and client secret verification) before issuing scoped Bearer tokens.
+- **Two-Step Destructive Action Challenge:** Deleting DNS records cannot be self-authorized by an LLM prompt. The server issues a short-lived cryptographic approval token (`del_tok_...`) that must be confirmed by the human operator.
+- **Modern Streamable HTTP & Legacy SSE:** Implements modern MCP Streamable HTTP (`POST /mcp`) alongside backward-compatible Server-Sent Events (`GET /mcp/sse`), complete with OPTIONS preflight handling and strict CORS origin allowlists.
+- **Fail-Closed Tool Authorization:** Any unmapped tool or caller lacking explicit RBAC scopes is denied with 403 Forbidden.
+- **Zero Direct Database Access:** Dispatches all operations through authorized upstream APIs.
+- **Deep Redaction:** Sensitive tokens, keys, and authorization headers are recursively sanitized from audit logs.
 
 ---
 
-## Quickstart: Claude Desktop Integration
+## Quickstart: Claude Desktop Integration (STDIO)
 
-To connect Claude Desktop to your Aeitron Infrastructure platform, add the following entry to your `claude_desktop_config.json`:
+To connect Claude Desktop to your Aeitron Infrastructure platform, configure `claude_desktop_config.json`:
 
 ### macOS / Linux:
 ```json
@@ -48,7 +52,7 @@ To connect Claude Desktop to your Aeitron Infrastructure platform, add the follo
       "args": ["/path/to/aeitron/apps/mcp-server/dist/cli.js"],
       "env": {
         "AEITRON_API_BASE_URL": "https://api.aeitron.com",
-        "AEITRON_API_KEY": "atk_live_your_aeitron_api_key_here"
+        "AEITRON_API_KEY": "your_authoritative_aeitron_api_key_here"
       }
     }
   }
@@ -64,7 +68,7 @@ To connect Claude Desktop to your Aeitron Infrastructure platform, add the follo
       "args": ["C:\\path\\to\\aeitron\\apps\\mcp-server\\dist\\cli.js"],
       "env": {
         "AEITRON_API_BASE_URL": "https://api.aeitron.com",
-        "AEITRON_API_KEY": "atk_live_your_aeitron_api_key_here"
+        "AEITRON_API_KEY": "your_authoritative_aeitron_api_key_here"
       }
     }
   }
@@ -73,22 +77,23 @@ To connect Claude Desktop to your Aeitron Infrastructure platform, add the follo
 
 ---
 
-## Remote Streamable HTTP (SSE) Deployment
+## Remote Streamable HTTP & SSE Deployment
 
-For remote AI clients (Claude Web, ChatGPT Custom Actions / Connectors, and cloud agents):
+For remote AI clients (Claude Web, ChatGPT Custom Connectors, Cursor):
 
-### Start the Remote HTTP Server:
+### Start the Remote Server:
 ```bash
-# Starts the server on port 3005 (or process.env.PORT)
 npm run serve
 ```
 
 ### Endpoints:
-- **SSE Handshake:** `GET /mcp/sse?token=<token>` (or `Authorization: Bearer <token>`)
+- **Streamable HTTP (Modern MCP):** `POST /mcp`
+- **SSE Handshake (Legacy MCP):** `GET /mcp/sse` (Headers: `Authorization: Bearer <token>`)
 - **JSON-RPC Messages:** `POST /mcp/messages?sessionId=<sessionId>`
 - **Health Check:** `GET /health`
 - **Readiness Probe:** `GET /ready`
 - **OAuth 2.0 Discovery:** `GET /.well-known/oauth-authorization-server`
+- **JWKS Key Set:** `GET /.well-known/jwks.json`
 
 ---
 
@@ -101,7 +106,6 @@ npm install
 # Compile TypeScript
 npm run build
 
-# Run full test suite (23 passing tests covering stdio, SSE, audit, and OAuth)
+# Run complete verification test suite (47 tests across 4 test suites)
 npm test
 ```
-
