@@ -25,7 +25,10 @@ import {
   authorizeDnsDeletionRequest,
   getPendingDnsDeletionRequest,
   listPendingDnsDeletionRequests,
-  toRedactedDnsRequestDto
+  toRedactedDnsRequestDto,
+  reconcileDnsDeletionStatus,
+  isStorageReady,
+  isRsaReady
 } from './auth.js';
 import { getConfig, McpServerConfig } from './config.js';
 import { ToolContext } from './types.js';
@@ -131,9 +134,28 @@ export function createMcpHttpServer(
   });
 
   app.get('/ready', (c) => {
+    const rsaReady = isRsaReady();
+    const storageReady = isStorageReady();
+    const isReady = rsaReady && storageReady;
+
+    if (!isReady) {
+      return c.json({
+        ready: false,
+        service: 'aeitron-mcp-server',
+        checks: {
+          rsa: rsaReady ? 'ok' : 'unready',
+          storage: storageReady ? 'ok' : 'unready'
+        }
+      }, 503);
+    }
+
     return c.json({
       ready: true,
       service: 'aeitron-mcp-server',
+      checks: {
+        rsa: 'ok',
+        storage: 'ok'
+      },
       supportedTransports: ['stdio', 'streamable-http', 'sse'],
       toolsAvailable: [
         'get_account',
@@ -341,11 +363,62 @@ export function createMcpHttpServer(
 
     const reqId = c.req.param('id');
     const request = getPendingDnsDeletionRequest(reqId);
-    if (!request || (auth.claims.tenantId !== 'anonymous' && request.tenantId !== auth.claims.tenantId)) {
+    const tenantId = auth.claims.tenantId;
+    if (!request || !tenantId || tenantId === 'anonymous' || request.tenantId !== tenantId) {
       return c.json({ error: 'not_found', error_description: 'Deletion request not found or expired.' }, 404);
     }
 
     return c.json({ request: toRedactedDnsRequestDto(request) });
+  });
+
+  // Reconcile status of a DNS deletion request against live zone truth
+  app.post('/v1/dns/deletion-requests/:id/reconcile', async (c: any) => {
+    const host = c.req.header('host') || 'localhost';
+    const parsedUrl = new URL(c.req.url, `http://${host}`);
+    const { token: rawToken } = extractTokenFromRequest(c.req.raw, parsedUrl);
+
+    const auth = verifyAuthToken(rawToken, {
+      isProduction: config.environment === 'production',
+      allowSandbox: config.allowSandbox,
+      jwtSecret: config.jwtSecret,
+      requiredScopes: ['dns:delete:approve']
+    });
+
+    if (!auth.success) {
+      return c.json({ error: 'unauthorized', error_description: auth.error }, auth.status);
+    }
+
+    const reqId = c.req.param('id');
+    const request = getPendingDnsDeletionRequest(reqId);
+    const tenantId = auth.claims.tenantId;
+    if (!request || !tenantId || tenantId === 'anonymous' || request.tenantId !== tenantId) {
+      return c.json({ error: 'not_found', error_description: 'Deletion request not found or expired.' }, 404);
+    }
+
+    const apiClient = new AeitronApiClient({
+      ...config,
+      defaultApiKey: auth.token
+    });
+
+    try {
+      const { records } = await apiClient.getDnsRecords(request.domain);
+      const recordStillExists = records.some((r) => r.id === request.recordId);
+      const reconciled = reconcileDnsDeletionStatus(reqId, recordStillExists);
+
+      return c.json({
+        success: reconciled.success,
+        requestId: reqId,
+        status: reconciled.status,
+        domain: request.domain,
+        recordId: request.recordId,
+        recordStillExists
+      });
+    } catch (err: unknown) {
+      return c.json({
+        error: 'reconciliation_failed',
+        error_description: `Failed to query live zone records: ${err instanceof Error ? err.message : String(err)}`
+      }, 502);
+    }
   });
 
   // 6. Welcome & Discovery
@@ -412,6 +485,26 @@ export function createMcpHttpServer(
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    // Top-Level Guard: Reject authentication tokens in URL query strings in hardened environments
+    // Prevents credential leakage across web server logs, proxy access logs, and HTTP referrers
+    const isHardened = config.environment === 'production' || config.environment === 'staging';
+    const authQueryParams = ['token', 'apiKey', 'api_key', 'access_token'];
+    if (isHardened && authQueryParams.some((k) => parsedUrl.searchParams.has(k))) {
+      res.writeHead(400, {
+        'Content-Type': 'application/problem+json',
+        'Cache-Control': 'no-store'
+      });
+      res.end(
+        JSON.stringify({
+          type: 'https://aeitron.com/errors/invalid-auth-transport',
+          title: 'Invalid Authentication Transport',
+          status: 400,
+          detail: 'Passing authentication tokens via URL query parameters is strictly prohibited in production and staging environments. Authentication tokens must be sent using the Authorization: Bearer <token> header.'
+        })
+      );
       return;
     }
 
@@ -722,10 +815,35 @@ export function createMcpHttpServer(
           await serverInstance.server.connect(transport);
         } catch (err: unknown) {
           activeSessions.delete(transport.sessionId);
+          try {
+            await transport.close();
+          } catch {}
+          try {
+            await serverInstance.server.close();
+          } catch {}
           if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: `Failed to initialize SSE session: ${String(err)}` }));
+            res.writeHead(500, { 'Content-Type': 'application/problem+json' });
+            res.end(JSON.stringify({
+              type: 'https://aeitron.com/errors/internal-server-error',
+              title: 'Internal Server Error',
+              status: 500,
+              detail: 'Failed to initialize SSE session transport.'
+            }));
+          } else {
+            res.destroy();
           }
+        }
+      } catch (err: unknown) {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/problem+json' });
+          res.end(JSON.stringify({
+            type: 'https://aeitron.com/errors/internal-server-error',
+            title: 'Internal Server Error',
+            status: 500,
+            detail: 'Failed to setup SSE session.'
+          }));
+        } else {
+          res.destroy();
         }
       } finally {
         releaseSessionSlot();

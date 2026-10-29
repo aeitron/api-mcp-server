@@ -14,7 +14,8 @@ import {
   createDnsDeletionRequest,
   verifyAndConsumeDnsDeletionApproval,
   markDnsDeletionCompleted,
-  markDnsDeletionFailed
+  markDnsDeletionFailed,
+  markDnsDeletionExecutionUnknown
 } from '../auth.js';
 
 export function registerDnsTools(
@@ -373,12 +374,43 @@ export function registerDnsTools(
           ]
         };
       } catch (err: unknown) {
-        markDnsDeletionFailed(tokenVerification.requestId);
+        const isTimeout =
+          (err as any)?.status === 504 ||
+          (err as any)?.name === 'AbortError' ||
+          (err instanceof Error && /timed out/i.test(err.message));
+
+        if (isTimeout) {
+          markDnsDeletionExecutionUnknown(tokenVerification.requestId, err instanceof Error ? err.message : String(err));
+        } else {
+          markDnsDeletionFailed(tokenVerification.requestId);
+        }
+
         const duration = Date.now() - startTime;
         audit.logToolExecution('delete_dns_record', args, duration, false, {
           tenantId: authClaims?.tenantId,
           actorId: authClaims?.actorId
         }, err);
+
+        if (isTimeout) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: [
+                  `⚠️ UPSTREAM TIMEOUT: Deletion request timed out while communicating with edge gateway.`,
+                  `- **Request ID:** \`${tokenVerification.requestId}\``,
+                  `- **Status:** \`execution_unknown\` (state locked against race conditions)`,
+                  `- **Impact:** The upstream DNS record deletion may have been applied or may have failed.`,
+                  ``,
+                  `To resolve this state safely, perform reconciliation via:`,
+                  `  \`POST /v1/dns/deletion-requests/${tokenVerification.requestId}/reconcile\``,
+                  `Or verify the live DNS zone records before attempting re-deletion.`
+                ].join('\n')
+              }
+            ]
+          };
+        }
 
         return {
           isError: true,

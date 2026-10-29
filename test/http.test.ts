@@ -1,7 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMcpHttpServer, McpHttpServerInstance } from '../src/http.js';
-import { createSignedTestJwt } from '../src/auth.js';
+import { createSignedTestJwt, createDnsDeletionRequest, markDnsDeletionExecutionUnknown } from '../src/auth.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -733,5 +733,119 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     const healthAfter = await healthAfterRes.json() as { activeSessions: number };
     // Verify active sessions count remains unchanged (no leaked session reservation)
     assert.equal(healthAfter.activeSessions, sessionsBefore);
+  });
+
+  it('27. Centralized Query Token Rejection: rejects query tokens across all endpoints in production', async () => {
+    const prodServer = createMcpHttpServer({
+      environment: 'production',
+      jwtSecret: 'prod_long_secret_key_32_characters_123!'
+    });
+
+    let prodUrl = '';
+    await new Promise<void>((resolve) => {
+      prodServer.httpServer.listen(0, '127.0.0.1', () => {
+        const addr = prodServer.httpServer.address();
+        const port = typeof addr === 'object' && addr !== null ? addr.port : 0;
+        prodUrl = `http://127.0.0.1:${port}`;
+        resolve();
+      });
+    });
+
+    try {
+      // 1. /mcp?token=...
+      const res1 = await fetch(`${prodUrl}/mcp?token=leak_token`);
+      assert.equal(res1.status, 400);
+
+      // 2. /v1/dns/deletion-requests?apiKey=...
+      const res2 = await fetch(`${prodUrl}/v1/dns/deletion-requests?apiKey=leak_key`);
+      assert.equal(res2.status, 400);
+
+      // 3. /v1/dns/deletion-requests/del_1?access_token=...
+      const res3 = await fetch(`${prodUrl}/v1/dns/deletion-requests/del_1?access_token=leak_access`);
+      assert.equal(res3.status, 400);
+
+      // 4. /v1/dns/approve-deletion?api_key=...
+      const res4 = await fetch(`${prodUrl}/v1/dns/approve-deletion?api_key=leak_api`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestId: 'del_1' })
+      });
+      assert.equal(res4.status, 400);
+    } finally {
+      await prodServer.close();
+    }
+  });
+
+  it('28. DNS Deletion Request Detail: strictly rejects anonymous tenant token with 404', async () => {
+    const req = createDnsDeletionRequest('tenant_secure_corp', 'usr_creator', 'corp.com', 'rec_corp_1');
+
+    // 1. Anonymous tenant token (must be rejected with 404)
+    const anonToken = createSignedTestJwt({
+      tenant_id: 'anonymous',
+      sub: 'usr_anon_operator',
+      scopes: ['dns:write:delete', 'dns:delete:approve']
+    });
+
+    const resAnon = await fetch(`${baseUrl}/v1/dns/deletion-requests/${req.requestId}`, {
+      headers: { 'Authorization': `Bearer ${anonToken}` }
+    });
+    assert.equal(resAnon.status, 404);
+
+    // 2. Other tenant token (must be rejected with 404)
+    const otherToken = createSignedTestJwt({
+      tenant_id: 'tenant_other_corp',
+      sub: 'usr_other_operator',
+      scopes: ['dns:write:delete', 'dns:delete:approve']
+    });
+
+    const resOther = await fetch(`${baseUrl}/v1/dns/deletion-requests/${req.requestId}`, {
+      headers: { 'Authorization': `Bearer ${otherToken}` }
+    });
+    assert.equal(resOther.status, 404);
+
+    // 3. Legitimate tenant operator token (returns 200)
+    const legitToken = createSignedTestJwt({
+      tenant_id: 'tenant_secure_corp',
+      sub: 'usr_legit_operator',
+      scopes: ['dns:write:delete', 'dns:delete:approve']
+    });
+
+    const resLegit = await fetch(`${baseUrl}/v1/dns/deletion-requests/${req.requestId}`, {
+      headers: { 'Authorization': `Bearer ${legitToken}` }
+    });
+    assert.equal(resLegit.status, 200);
+    const legitData = await resLegit.json() as { request: Record<string, unknown> };
+    assert.equal(legitData.request['requestId'], req.requestId);
+    assert.strictEqual(legitData.request['approvalToken'], undefined);
+  });
+
+  it('29. DNS Deletion Reconciliation: reconciles execution_unknown request with live zone records', async () => {
+    const req = createDnsDeletionRequest('tenant_test_workspace', 'usr_creator', 'example.com', 'rec_reconcile_1');
+    markDnsDeletionExecutionUnknown(req.requestId, 'Upstream timeout simulated');
+
+    const operatorToken = createSignedTestJwt({
+      tenant_id: 'tenant_test_workspace',
+      sub: 'usr_operator_recon',
+      scopes: ['dns:delete:approve']
+    });
+
+    const res = await fetch(`${baseUrl}/v1/dns/deletion-requests/${req.requestId}/reconcile`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${operatorToken}` }
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json() as { success: boolean; status: string; requestId: string };
+    assert.equal(data.success, true);
+    assert.equal(data.requestId, req.requestId);
+    assert.ok(data.status === 'completed' || data.status === 'failed');
+  });
+
+  it('30. GET /ready: verifies cryptographic and storage subsystem readiness checks', async () => {
+    const res = await fetch(`${baseUrl}/ready`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { ready: boolean; checks: { rsa: string; storage: string } };
+    assert.equal(body.ready, true);
+    assert.equal(body.checks.rsa, 'ok');
+    assert.equal(body.checks.storage, 'ok');
   });
 });

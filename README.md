@@ -106,6 +106,6 @@ npm install
 # Compile TypeScript
 npm run build
 
-# Run complete verification test suite (99 tests across 5 test suites)
+# Run complete verification test suite (109 tests across 6 test suites)
 npm test
 ```

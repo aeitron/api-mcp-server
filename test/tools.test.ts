@@ -5,7 +5,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { createAeitronMcpServer } from '../src/server.js';
 import { AuditLogger } from '../src/audit.js';
 import { AuditRecord } from '../src/types.js';
-import { issueDnsDeletionChallenge, authorizeDnsDeletionRequest, createSignedTestJwt } from '../src/auth.js';
+import {
+  issueDnsDeletionChallenge,
+  authorizeDnsDeletionRequest,
+  createSignedTestJwt,
+  getPendingDnsDeletionRequest
+} from '../src/auth.js';
 import { handleDnsApproveDeletion } from '../src/cli.js';
 
 describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
@@ -497,5 +502,59 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
 
     await limitedClient.close();
     await readOnlyServer.server.close();
+  });
+
+  it('15. delete_dns_record: upstream timeout marks request as execution_unknown and provides operator guidance', async () => {
+    const timingOutClient = {
+      deleteDnsRecord: async () => {
+        const err = new Error('Request timed out after 5000ms');
+        err.name = 'AbortError';
+        throw err;
+      }
+    } as any;
+
+    const timeoutServer = createAeitronMcpServer({
+      client: timingOutClient,
+      authClaims: {
+        tenantId: 'tenant_customerAcme',
+        actorId: 'usr_live_acme_admin',
+        tier: 'enterprise',
+        scopes: ['dns:write:delete'],
+        livemode: true
+      }
+    });
+
+    const timeoutMcpClient = new Client({ name: 'timeout-client', version: '1.0.0' });
+    const [cTransport, sTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      timeoutServer.server.connect(sTransport),
+      timeoutMcpClient.connect(cTransport)
+    ]);
+
+    const challenge = issueDnsDeletionChallenge('tenant_customerAcme', 'aeitron.com', 'rec_timeout_record_1');
+
+    const result = await timeoutMcpClient.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_timeout_record_1',
+        confirm: true,
+        approvalToken: challenge.token
+      }
+    });
+
+    assert.equal(result.isError, true);
+    const content = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(content.includes('UPSTREAM TIMEOUT'));
+    assert.ok(content.includes('execution_unknown'));
+    assert.ok(content.includes('reconcile'));
+
+    // Verify request in state is indeed execution_unknown
+    const stateReq = getPendingDnsDeletionRequest(challenge.requestId);
+    assert.ok(stateReq);
+    assert.equal(stateReq.status, 'execution_unknown');
+
+    await timeoutMcpClient.close();
+    await timeoutServer.server.close();
   });
 });

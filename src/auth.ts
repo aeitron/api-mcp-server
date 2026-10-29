@@ -379,29 +379,47 @@ function sleepSync(ms: number): void {
 
 /**
  * Cross-process atomic lock using exclusive lockfile flag 'wx'.
- * Handles stale locks (>10s old) and retries with backoff up to 5000ms.
+ * Tracks ownerToken to eliminate release races and validates process liveness.
  */
 function acquireDnsStateLock(): () => void {
   const dir = ensureStorageDir();
   const lockPath = path.join(dir, 'dns-deletion-state.lock');
   const maxWaitMs = 5000;
   const start = Date.now();
-  let fd: number | null = null;
+  const ownerToken = crypto.randomUUID();
+  let acquired = false;
 
   while (Date.now() - start < maxWaitMs) {
     try {
-      fd = fs.openSync(lockPath, 'wx');
-      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeFileSync(fd, JSON.stringify({ ownerToken, pid: process.pid, createdAt: Date.now() }));
+      fs.closeSync(fd);
+      acquired = true;
       break;
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code;
       if (code === 'EEXIST' || code === 'EBUSY') {
         try {
-          const stats = fs.statSync(lockPath);
-          if (Date.now() - stats.mtimeMs > 10000) {
-            try {
-              fs.unlinkSync(lockPath);
-            } catch {}
+          if (fs.existsSync(lockPath)) {
+            const content = fs.readFileSync(lockPath, 'utf-8');
+            const data = JSON.parse(content);
+            const isProcessDead = (() => {
+              if (typeof data.pid !== 'number') return true;
+              try {
+                process.kill(data.pid, 0);
+                return false;
+              } catch (killErr: any) {
+                return killErr?.code === 'ESRCH';
+              }
+            })();
+
+            const isStale = typeof data.createdAt === 'number' && (Date.now() - data.createdAt > 30000);
+
+            if (isProcessDead || isStale) {
+              try {
+                fs.unlinkSync(lockPath);
+              } catch {}
+            }
           }
         } catch {}
         sleepSync(20);
@@ -411,18 +429,19 @@ function acquireDnsStateLock(): () => void {
     }
   }
 
-  if (fd === null) {
+  if (!acquired) {
     throw new Error('TIMEOUT: Failed to acquire DNS state lock within 5000ms.');
   }
 
   return () => {
     try {
-      if (fd !== null) {
-        fs.closeSync(fd);
+      if (fs.existsSync(lockPath)) {
+        const content = fs.readFileSync(lockPath, 'utf-8');
+        const data = JSON.parse(content);
+        if (data.ownerToken === ownerToken) {
+          fs.unlinkSync(lockPath);
+        }
       }
-    } catch {}
-    try {
-      fs.unlinkSync(lockPath);
     } catch {}
   };
 }
@@ -436,7 +455,13 @@ export function withDnsStateLock<T>(fn: () => T): T {
   }
 }
 
-export type DnsDeletionStatus = 'pending' | 'approved' | 'executing' | 'completed' | 'failed';
+export type DnsDeletionStatus =
+  | 'pending'
+  | 'approved'
+  | 'executing'
+  | 'completed'
+  | 'failed'
+  | 'execution_unknown';
 
 // Pending deletion requests awaiting human operator approval
 export interface PendingDeletionRequest {
@@ -456,6 +481,7 @@ export interface PendingDeletionRequest {
   consumed?: boolean;
   consumedAt?: number;
   completedAt?: number;
+  lastError?: string;
 }
 
 const PENDING_DELETION_REQUESTS = new Map<string, PendingDeletionRequest>();
@@ -465,6 +491,27 @@ export interface DnsStatePayload {
   version: 1;
   requests: PendingDeletionRequest[];
   consumedTokenHashes: string[];
+}
+
+const ALLOWED_STATUSES = new Set<DnsDeletionStatus>([
+  'pending',
+  'approved',
+  'executing',
+  'completed',
+  'failed',
+  'execution_unknown'
+]);
+
+function assertValidTimestamp(value: unknown, field: string): asserts value is number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`Invalid state file: ${field} must be a positive safe integer timestamp`);
+  }
+}
+
+function assertValidSha256(value: unknown, field: string): asserts value is string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/i.test(value)) {
+    throw new Error(`Invalid state file: ${field} must be a 64-char SHA-256 hex string`);
+  }
 }
 
 export function validateDnsStatePayload(data: unknown): DnsStatePayload {
@@ -488,17 +535,41 @@ export function validateDnsStatePayload(data: unknown): DnsStatePayload {
       throw new Error('Invalid state file: request entry must be an object');
     }
     const r = item as Record<string, unknown>;
-    if (
-      typeof r.requestId !== 'string' ||
-      typeof r.tenantId !== 'string' ||
-      typeof r.actorId !== 'string' ||
-      typeof r.domain !== 'string' ||
-      typeof r.recordId !== 'string' ||
-      typeof r.createdAt !== 'number' ||
-      typeof r.expiresAt !== 'number'
-    ) {
-      throw new Error(`Invalid state file: missing or invalid required fields in request ${r.requestId || 'unknown'}`);
+    if (typeof r.requestId !== 'string' || !r.requestId.trim()) {
+      throw new Error('Invalid state file: requestId must be a non-empty string');
     }
+    if (typeof r.tenantId !== 'string' || !r.tenantId.trim() || r.tenantId === 'anonymous') {
+      throw new Error(`Invalid state file: tenantId must be a valid non-anonymous string in request ${r.requestId}`);
+    }
+    if (typeof r.actorId !== 'string' || !r.actorId.trim()) {
+      throw new Error(`Invalid state file: actorId must be a non-empty string in request ${r.requestId}`);
+    }
+    if (typeof r.domain !== 'string' || !r.domain.trim()) {
+      throw new Error(`Invalid state file: domain must be a non-empty string in request ${r.requestId}`);
+    }
+    if (typeof r.recordId !== 'string' || !r.recordId.trim()) {
+      throw new Error(`Invalid state file: recordId must be a non-empty string in request ${r.requestId}`);
+    }
+
+    assertValidTimestamp(r.createdAt, `createdAt in request ${r.requestId}`);
+    assertValidTimestamp(r.expiresAt, `expiresAt in request ${r.requestId}`);
+    if (r.expiresAt <= r.createdAt) {
+      throw new Error(`Invalid state file: expiresAt must be greater than createdAt in request ${r.requestId}`);
+    }
+
+    if (typeof r.authorized !== 'boolean') {
+      throw new Error(`Invalid state file: authorized must be a strict boolean in request ${r.requestId}`);
+    }
+
+    const rawStatus = (r.status as DnsDeletionStatus) || (r.consumed ? 'completed' : r.authorized ? 'approved' : 'pending');
+    if (!ALLOWED_STATUSES.has(rawStatus)) {
+      throw new Error(`Invalid state file: status '${rawStatus}' is not allowed in request ${r.requestId}`);
+    }
+
+    if (r.approvalTokenHash !== undefined) {
+      assertValidSha256(r.approvalTokenHash, `approvalTokenHash in request ${r.requestId}`);
+    }
+
     validRequests.push({
       requestId: r.requestId,
       tenantId: r.tenantId,
@@ -507,24 +578,23 @@ export function validateDnsStatePayload(data: unknown): DnsStatePayload {
       recordId: r.recordId,
       createdAt: r.createdAt,
       expiresAt: r.expiresAt,
-      status: (r.status as DnsDeletionStatus) || (r.consumed ? 'completed' : r.authorized ? 'approved' : 'pending'),
-      authorized: Boolean(r.authorized),
+      status: rawStatus,
+      authorized: r.authorized,
       authorizedBy: typeof r.authorizedBy === 'string' ? r.authorizedBy : undefined,
       authorizedAt: typeof r.authorizedAt === 'number' ? r.authorizedAt : undefined,
       approvalTokenHash: typeof r.approvalTokenHash === 'string' ? r.approvalTokenHash : undefined,
       approvalToken: typeof r.approvalToken === 'string' ? r.approvalToken : undefined,
       consumed: Boolean(r.consumed),
       consumedAt: typeof r.consumedAt === 'number' ? r.consumedAt : undefined,
-      completedAt: typeof r.completedAt === 'number' ? r.completedAt : undefined
+      completedAt: typeof r.completedAt === 'number' ? r.completedAt : undefined,
+      lastError: typeof r.lastError === 'string' ? r.lastError : undefined
     });
   }
 
   const validHashes: string[] = [];
   for (const h of obj.consumedTokenHashes) {
-    if (typeof h !== 'string' || h.length !== 64) {
-      throw new Error(`Invalid state file: consumedTokenHash must be a 64-char SHA-256 hex string, got '${h}'`);
-    }
-    validHashes.push(h);
+    assertValidSha256(h, 'consumedTokenHashes entry');
+    validHashes.push(h.toLowerCase());
   }
 
   return {
@@ -1526,6 +1596,66 @@ export function markDnsDeletionFailed(requestId: string): void {
       saveDnsStateToDisk();
     }
   });
+}
+
+/**
+ * Transitions a DNS deletion request to execution_unknown status when an upstream timeout occurs.
+ * Prevents premature failure while requiring reconciliation before terminal completion.
+ */
+export function markDnsDeletionExecutionUnknown(requestId: string, lastError?: string): void {
+  withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+    const req = PENDING_DELETION_REQUESTS.get(requestId);
+    if (req) {
+      req.status = 'execution_unknown';
+      req.lastError = lastError;
+      saveDnsStateToDisk();
+    }
+  });
+}
+
+/**
+ * Reconciles the status of an execution_unknown or executing request against live zone truth.
+ */
+export function reconcileDnsDeletionStatus(
+  requestId: string,
+  recordStillExists: boolean
+): { success: boolean; status: DnsDeletionStatus } {
+  return withDnsStateLock(() => {
+    loadDnsStateFromDisk();
+    const req = PENDING_DELETION_REQUESTS.get(requestId);
+    if (!req) {
+      return { success: false, status: 'failed' };
+    }
+    if (req.status === 'execution_unknown' || req.status === 'executing') {
+      if (!recordStillExists) {
+        req.status = 'completed';
+        req.completedAt = Date.now();
+      } else {
+        req.status = 'failed';
+      }
+      saveDnsStateToDisk();
+      return { success: true, status: req.status };
+    }
+    return { success: true, status: req.status };
+  });
+}
+
+export function isStorageReady(): boolean {
+  try {
+    const dir = ensureStorageDir();
+    return fs.existsSync(dir);
+  } catch {
+    return false;
+  }
+}
+
+export function isRsaReady(): boolean {
+  try {
+    return REGISTERED_PUBLIC_KEYS.size > 0 && Boolean(ACTIVE_KID);
+  } catch {
+    return false;
+  }
 }
 
 // Backwards-compatible alias

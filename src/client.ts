@@ -70,8 +70,6 @@ export class AeitronApiClient {
         signal: controller.signal
       });
 
-      clearTimeout(timeoutId);
-
       if (!response.ok) {
         let errorMsg = `Upstream API returned HTTP ${response.status} ${response.statusText}`;
         let errorCode: string | undefined;
@@ -95,8 +93,6 @@ export class AeitronApiClient {
 
       return await response.json() as T;
     } catch (err: unknown) {
-      clearTimeout(timeoutId);
-
       if (err instanceof AeitronApiError) {
         throw err;
       }
@@ -112,6 +108,8 @@ export class AeitronApiClient {
         : `Network error connecting to Aeitron API at ${url}: ${(err as Error)?.message || String(err)}`;
 
       throw new AeitronApiError(msg, 503, 'SERVICE_UNAVAILABLE');
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 

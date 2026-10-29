@@ -25,6 +25,10 @@ import {
   validateDnsStatePayload,
   markDnsDeletionCompleted,
   markDnsDeletionFailed,
+  markDnsDeletionExecutionUnknown,
+  reconcileDnsDeletionStatus,
+  isStorageReady,
+  isRsaReady,
   withDnsStateLock,
   toRedactedDnsRequestDto,
   ACTIVE_KID
@@ -758,5 +762,86 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     });
     assert.equal(executed, true);
     assert.equal(result, 'lock_success');
+  });
+
+  it('markDnsDeletionExecutionUnknown and reconcileDnsDeletionStatus handle upstream timeout safely', () => {
+    const req = createDnsDeletionRequest('tenant_timeout_test', 'usr_client', 'example.com', 'rec_timeout_1');
+    assert.ok(req.requestId);
+
+    // Operator authorizes
+    const authRes = authorizeDnsDeletionRequest(
+      {
+        actorId: 'usr_operator_timeout',
+        tenantId: 'tenant_timeout_test',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false
+      },
+      req.requestId
+    );
+    assert.equal(authRes.success, true);
+    if (!authRes.success) return;
+
+    // Execution starts (consumed challenge)
+    verifyDnsDeletionChallenge(authRes.token, 'tenant_timeout_test', 'example.com', 'rec_timeout_1');
+
+    // Upstream times out: transition to execution_unknown
+    markDnsDeletionExecutionUnknown(req.requestId, 'Gateway timeout after 5000ms');
+
+    // Reconcile when record has already been removed by upstream edge
+    const reconcileSuccess = reconcileDnsDeletionStatus(req.requestId, false);
+    assert.equal(reconcileSuccess.success, true);
+    assert.equal(reconcileSuccess.status, 'completed');
+
+    // Reconcile a failed timeout (record still present)
+    const req2 = createDnsDeletionRequest('tenant_timeout_test', 'usr_client', 'example.com', 'rec_timeout_2');
+    markDnsDeletionExecutionUnknown(req2.requestId, 'Connection reset by peer');
+    const reconcileFailed = reconcileDnsDeletionStatus(req2.requestId, true);
+    assert.equal(reconcileFailed.success, true);
+    assert.equal(reconcileFailed.status, 'failed');
+  });
+
+  it('validateDnsStatePayload: rejects invalid timestamps, non-boolean authorized, and invalid statuses', () => {
+    const baseRequest = {
+      requestId: 'del_req_valid',
+      tenantId: 'tenant_1',
+      actorId: 'usr_1',
+      domain: 'aeitron.com',
+      recordId: 'rec_1',
+      createdAt: 1000,
+      expiresAt: 2000,
+      authorized: false
+    };
+
+    // Non-integer timestamp
+    assert.throws(
+      () => validateDnsStatePayload({ version: 1, requests: [{ ...baseRequest, createdAt: '1000' }], consumedTokenHashes: [] }),
+      /createdAt in request del_req_valid must be a positive safe integer timestamp/
+    );
+
+    // expiresAt <= createdAt
+    assert.throws(
+      () => validateDnsStatePayload({ version: 1, requests: [{ ...baseRequest, expiresAt: 900 }], consumedTokenHashes: [] }),
+      /expiresAt must be greater than createdAt/
+    );
+
+    // Non-strict boolean authorized
+    assert.throws(
+      () => validateDnsStatePayload({ version: 1, requests: [{ ...baseRequest, authorized: 'true' }], consumedTokenHashes: [] }),
+      /authorized must be a strict boolean/
+    );
+
+    // Invalid status string
+    assert.throws(
+      () => validateDnsStatePayload({ version: 1, requests: [{ ...baseRequest, status: 'nuked' }], consumedTokenHashes: [] }),
+      /status 'nuked' is not allowed/
+    );
+  });
+
+  it('isStorageReady and isRsaReady verify server operational readiness', () => {
+    assert.equal(typeof isStorageReady(), 'boolean');
+    assert.equal(typeof isRsaReady(), 'boolean');
+    assert.equal(isStorageReady(), true);
+    assert.equal(isRsaReady(), true);
   });
 });
