@@ -19,8 +19,12 @@ import {
   getOAuthDiscoveryMetadata,
   getJwksMetadata,
   createSignedTestJwt,
+  issueOAuthAccessToken,
   verifyOAuthClient,
-  registerOAuthClientForTesting
+  registerOAuthClientForTesting,
+  authorizeDnsDeletionRequest,
+  getPendingDnsDeletionRequest,
+  listPendingDnsDeletionRequests
 } from './auth.js';
 import { getConfig, McpServerConfig } from './config.js';
 import { ToolContext } from './types.js';
@@ -194,11 +198,8 @@ export function createMcpHttpServer(
     }
 
     const client = verification.client;
-    const token = createSignedTestJwt({
-      sub: client.actorId,
-      tenant_id: client.tenantId,
-      scopes: client.scopes
-    }, config.jwtSecret);
+    // Issue RFC 7519 / RFC 7517 compliant RS256 token matching the published JWKS public keys
+    const token = issueOAuthAccessToken(client);
 
     return c.json({
       access_token: token,
@@ -206,6 +207,103 @@ export function createMcpHttpServer(
       expires_in: 3600,
       scope: client.scopes.join(' ')
     });
+  });
+
+  // 5b. Authenticated Human Operator DNS Deletion Approval Endpoint
+  // Bridges MCP DNS deletion challenge requests to authorized operator console/CLI
+  const dnsApprovalHandler = async (c: any) => {
+    const host = c.req.header('host') || 'localhost';
+    const parsedUrl = new URL(c.req.url, `http://${host}`);
+    const { token: rawToken } = extractTokenFromRequest(c.req.raw, parsedUrl);
+
+    const auth = verifyAuthToken(rawToken, {
+      isProduction: config.environment === 'production',
+      allowSandbox: config.allowSandbox,
+      jwtSecret: config.jwtSecret
+    });
+
+    if (!auth.success) {
+      return c.json({
+        error: 'unauthorized',
+        error_description: auth.error
+      }, auth.status);
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const requestId = String(body['requestId'] || body['request_id'] || '').trim();
+
+    if (!requestId) {
+      return c.json({
+        error: 'invalid_request',
+        error_description: 'Missing mandatory "requestId" field in JSON body.'
+      }, 400);
+    }
+
+    const result = authorizeDnsDeletionRequest(auth.claims, requestId);
+    if (!result.success) {
+      return c.json({
+        error: result.status === 403 ? 'forbidden' : result.status === 404 ? 'not_found' : 'invalid_request',
+        error_description: result.error
+      }, result.status);
+    }
+
+    return c.json({
+      success: true,
+      requestId: result.requestId,
+      approvalToken: result.token,
+      expiresAt: result.expiresAt,
+      domain: result.domain,
+      recordId: result.recordId,
+      message: 'DNS deletion request successfully authorized. Provide this approvalToken to delete_dns_record.'
+    });
+  };
+
+  app.post('/v1/dns/approve-deletion', dnsApprovalHandler);
+  app.post('/mcp/dns/approve-deletion', dnsApprovalHandler);
+
+  // List pending DNS deletion requests awaiting approval
+  app.get('/v1/dns/deletion-requests', (c: any) => {
+    const host = c.req.header('host') || 'localhost';
+    const parsedUrl = new URL(c.req.url, `http://${host}`);
+    const { token: rawToken } = extractTokenFromRequest(c.req.raw, parsedUrl);
+
+    const auth = verifyAuthToken(rawToken, {
+      isProduction: config.environment === 'production',
+      allowSandbox: config.allowSandbox,
+      jwtSecret: config.jwtSecret
+    });
+
+    if (!auth.success) {
+      return c.json({ error: 'unauthorized', error_description: auth.error }, auth.status);
+    }
+
+    const requests = listPendingDnsDeletionRequests(auth.claims.tenantId);
+    return c.json({ requests });
+  });
+
+  // Get specific DNS deletion request details
+  app.get('/v1/dns/deletion-requests/:id', (c: any) => {
+    const host = c.req.header('host') || 'localhost';
+    const parsedUrl = new URL(c.req.url, `http://${host}`);
+    const { token: rawToken } = extractTokenFromRequest(c.req.raw, parsedUrl);
+
+    const auth = verifyAuthToken(rawToken, {
+      isProduction: config.environment === 'production',
+      allowSandbox: config.allowSandbox,
+      jwtSecret: config.jwtSecret
+    });
+
+    if (!auth.success) {
+      return c.json({ error: 'unauthorized', error_description: auth.error }, auth.status);
+    }
+
+    const reqId = c.req.param('id');
+    const request = getPendingDnsDeletionRequest(reqId);
+    if (!request || (auth.claims.tenantId !== 'anonymous' && request.tenantId !== auth.claims.tenantId)) {
+      return c.json({ error: 'not_found', error_description: 'Deletion request not found or expired.' }, 404);
+    }
+
+    return c.json({ request });
   });
 
   // 6. Welcome & Discovery
@@ -304,6 +402,17 @@ export function createMcpHttpServer(
       if (req.method === 'DELETE') {
         if (sessionIdHeader && streamableSessions.has(sessionIdHeader)) {
           const session = streamableSessions.get(sessionIdHeader)!;
+          // Security Check: Cross-Tenant Session Binding
+          if (session.claims.tenantId !== auth.claims.tenantId || session.claims.actorId !== auth.claims.actorId) {
+            res.writeHead(403, { 'Content-Type': 'application/problem+json' });
+            res.end(JSON.stringify({
+              type: 'https://aeitron.com/errors/forbidden',
+              title: 'Forbidden',
+              status: 403,
+              detail: 'Cross-tenant session access prohibited. Authenticated caller identity does not match session owner.'
+            }));
+            return;
+          }
           await session.transport.close();
           await session.serverInstance.server.close();
           streamableSessions.delete(sessionIdHeader);
@@ -325,6 +434,17 @@ export function createMcpHttpServer(
       if (req.method === 'GET') {
         if (sessionIdHeader && streamableSessions.has(sessionIdHeader)) {
           const session = streamableSessions.get(sessionIdHeader)!;
+          // Security Check: Cross-Tenant Session Binding
+          if (session.claims.tenantId !== auth.claims.tenantId || session.claims.actorId !== auth.claims.actorId) {
+            res.writeHead(403, { 'Content-Type': 'application/problem+json' });
+            res.end(JSON.stringify({
+              type: 'https://aeitron.com/errors/forbidden',
+              title: 'Forbidden',
+              status: 403,
+              detail: 'Cross-tenant session access prohibited. Authenticated caller identity does not match session owner.'
+            }));
+            return;
+          }
           session.lastActiveAt = Date.now();
           await session.transport.handleRequest(req, res);
           return;
@@ -353,8 +473,34 @@ export function createMcpHttpServer(
             }));
             return;
           }
+          // Security Check: Cross-Tenant Session Binding
+          if (session.claims.tenantId !== auth.claims.tenantId || session.claims.actorId !== auth.claims.actorId) {
+            res.writeHead(403, { 'Content-Type': 'application/problem+json' });
+            res.end(JSON.stringify({
+              type: 'https://aeitron.com/errors/forbidden',
+              title: 'Forbidden',
+              status: 403,
+              detail: 'Cross-tenant session access prohibited. Authenticated caller identity does not match session owner.'
+            }));
+            return;
+          }
           session.lastActiveAt = Date.now();
           await session.transport.handleRequest(req, res);
+          return;
+        }
+
+        // Capacity Guard: Maximum active sessions limit
+        if (streamableSessions.size + activeSessions.size >= config.maxActiveSessions) {
+          res.writeHead(503, {
+            'Content-Type': 'application/problem+json',
+            'Retry-After': '30'
+          });
+          res.end(JSON.stringify({
+            type: 'https://aeitron.com/errors/service-unavailable',
+            title: 'Service Unavailable',
+            status: 503,
+            detail: `Maximum active sessions capacity (${config.maxActiveSessions}) reached. Please retry later.`
+          }));
           return;
         }
 
@@ -504,6 +650,26 @@ export function createMcpHttpServer(
         return;
       }
 
+      // Security Check: Cross-Tenant Session Binding on SSE Messages
+      const { token: rawToken } = extractTokenFromRequest(req, parsedUrl);
+      if (rawToken) {
+        const auth = verifyAuthToken(rawToken, {
+          isProduction: config.environment === 'production',
+          allowSandbox: config.allowSandbox,
+          jwtSecret: config.jwtSecret
+        });
+        if (auth.success && (auth.claims.tenantId !== session.context.tenantId || auth.claims.actorId !== session.context.actorId)) {
+          res.writeHead(403, { 'Content-Type': 'application/problem+json' });
+          res.end(JSON.stringify({
+            type: 'https://aeitron.com/errors/forbidden',
+            title: 'Forbidden',
+            status: 403,
+            detail: 'Cross-tenant session access prohibited. Caller identity does not match SSE session owner.'
+          }));
+          return;
+        }
+      }
+
       try {
         await session.transport.handlePostMessage(req, res);
       } catch (err: unknown) {
@@ -519,6 +685,28 @@ export function createMcpHttpServer(
     honoListener(req, res);
   });
 
+  // 8. Periodic Stale Session Cleanup Timer (Enforces idle session expiration)
+  const sweepIntervalMs = Math.min(config.sessionIdleTimeoutMs, 30000);
+  const idleCleanupInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [id, session] of streamableSessions.entries()) {
+      if (now - session.lastActiveAt > config.sessionIdleTimeoutMs) {
+        streamableSessions.delete(id);
+        session.transport.close().catch(() => {});
+        session.serverInstance.server.close().catch(() => {});
+      }
+    }
+
+    for (const [id, session] of activeSessions.entries()) {
+      if (now - session.createdAt.getTime() > config.sessionIdleTimeoutMs) {
+        activeSessions.delete(id);
+        session.transport.close().catch(() => {});
+        session.serverInstance.server.close().catch(() => {});
+      }
+    }
+  }, sweepIntervalMs);
+  idleCleanupInterval.unref();
+
   return {
     httpServer,
     app,
@@ -528,6 +716,8 @@ export function createMcpHttpServer(
       return typeof addr === 'object' && addr !== null ? addr.port : 0;
     },
     close: async () => {
+      clearInterval(idleCleanupInterval);
+
       for (const session of activeSessions.values()) {
         try {
           await session.transport.close();

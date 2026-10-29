@@ -111,6 +111,17 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     assert.equal(body.token_type, 'Bearer');
     assert.ok(typeof body.access_token === 'string' && body.access_token.startsWith('eyJ'));
     assert.equal(body.expires_in, 3600);
+
+    // Verify token is signed with RS256 and contains matching kid in header
+    const [hB64, pB64] = body.access_token.split('.');
+    const header = JSON.parse(Buffer.from(hB64, 'base64url').toString('utf-8')) as { alg: string; kid: string };
+    assert.equal(header.alg, 'RS256', 'OAuth token must be signed with RS256');
+    assert.equal(header.kid, 'aeitron-mcp-rsa-2026-v1', 'OAuth token kid must match active JWKS key');
+
+    // Verify token verifies against JWKS metadata
+    const jwksRes = await fetch(`${baseUrl}/.well-known/jwks.json`);
+    const jwks = await jwksRes.json() as { keys: Array<{ kid: string; alg: string; kty: string }> };
+    assert.ok(jwks.keys.some((k) => k.kid === header.kid && k.alg === 'RS256' && k.kty === 'RSA'));
   });
 
   it('8. CORS Preflight: handles OPTIONS requests on /mcp/sse and sets standard CORS headers', async () => {
@@ -250,5 +261,232 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     const problem = await res.json() as { type: string; status: number };
     assert.equal(problem.status, 401);
     assert.ok(problem.type.includes('unauthorized'));
+  });
+
+  it('16. Cross-Tenant Protection: rejects session access when token tenant does not match session owner', async () => {
+    // 1. Tenant A creates a valid session
+    const tenantAToken = 'atk_sandbox_tenant_a_token';
+    const initRes = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Authorization': `Bearer ${tenantAToken}`
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'tenant-a-client', version: '1.0' }
+        },
+        id: 1
+      })
+    });
+
+    assert.equal(initRes.status, 200);
+    const sessionId = initRes.headers.get('mcp-session-id');
+    assert.ok(sessionId, 'Server must return Mcp-Session-Id header');
+
+    // 2. Tenant B obtains a valid JWT with a different tenant ID
+    const { createSignedTestJwt } = await import('../src/auth.js');
+    const tenantBJwt = createSignedTestJwt({
+      sub: 'usr_tenant_b_attacker',
+      tenant_id: 'tenant_different_b',
+      scopes: ['account:read', 'dns:read']
+    });
+
+    // 3. Tenant B attempts to call tools on Tenant A's session -> MUST BE STRICTLY 403 FORBIDDEN
+    const hijackRes = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Mcp-Session-Id': sessionId,
+        'Authorization': `Bearer ${tenantBJwt}`
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'tools/list',
+        id: 2
+      })
+    });
+
+    assert.equal(hijackRes.status, 403);
+    const hijackBody = await hijackRes.json() as { status: number; detail: string };
+    assert.equal(hijackBody.status, 403);
+    assert.ok(hijackBody.detail.includes('Cross-tenant session access prohibited'));
+
+    // 4. Tenant B attempts to delete Tenant A's session -> MUST ALSO BE 403 FORBIDDEN
+    const deleteRes = await fetch(`${baseUrl}/mcp`, {
+      method: 'DELETE',
+      headers: {
+        'Mcp-Session-Id': sessionId,
+        'Authorization': `Bearer ${tenantBJwt}`
+      }
+    });
+
+    assert.equal(deleteRes.status, 403);
+  });
+
+  it('17. Human Operator DNS Deletion Approval: authorizes request via POST /v1/dns/approve-deletion', async () => {
+    const { createDnsDeletionRequest, createSignedTestJwt } = await import('../src/auth.js');
+    
+    // Create pending deletion request
+    const req = createDnsDeletionRequest('tenant_customerAcme', 'usr_agent_01', 'aeitron.com', 'rec_cname_999');
+    assert.ok(req.requestId.startsWith('del_req_'));
+
+    // Operator with insufficient scopes attempts approval -> 403 Forbidden
+    const unprivilegedToken = createSignedTestJwt({
+      sub: 'usr_readonly_op',
+      tenant_id: 'tenant_customerAcme',
+      scopes: ['account:read', 'dns:read'] // missing dns:write:delete
+    });
+
+    const unprivRes = await fetch(`${baseUrl}/v1/dns/approve-deletion`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${unprivilegedToken}`
+      },
+      body: JSON.stringify({ requestId: req.requestId })
+    });
+    assert.equal(unprivRes.status, 403);
+
+    // Operator with valid dns:write:delete scope approves deletion request -> 200 OK with approvalToken
+    const operatorToken = createSignedTestJwt({
+      sub: 'usr_authorized_operator',
+      tenant_id: 'tenant_customerAcme',
+      scopes: ['dns:write:delete']
+    });
+
+    const approveRes = await fetch(`${baseUrl}/v1/dns/approve-deletion`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${operatorToken}`
+      },
+      body: JSON.stringify({ requestId: req.requestId })
+    });
+
+    assert.equal(approveRes.status, 200);
+    const approveBody = await approveRes.json() as { success: boolean; approvalToken: string; requestId: string };
+    assert.equal(approveBody.success, true);
+    assert.equal(approveBody.requestId, req.requestId);
+    assert.ok(approveBody.approvalToken.startsWith('del_tok_'));
+  });
+
+  it('18. Session Capacity Guard: rejects new session creation when maxActiveSessions is reached', async () => {
+    // Create server with capacity limit of 1
+    const limitedServer = createMcpHttpServer({
+      environment: 'development',
+      maxActiveSessions: 1
+    });
+
+    await new Promise<void>((resolve) => {
+      limitedServer.httpServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    const limitedAddr = limitedServer.httpServer.address();
+    const limitedPort = typeof limitedAddr === 'object' && limitedAddr !== null ? limitedAddr.port : 0;
+    const limitedBaseUrl = `http://127.0.0.1:${limitedPort}`;
+
+    try {
+      // First session succeeds
+      const res1 = await fetch(`${limitedBaseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Authorization': 'Bearer atk_sandbox_session_1'
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'c1', version: '1.0' } },
+          id: 1
+        })
+      });
+      assert.equal(res1.status, 200);
+
+      // Second session must be rejected with 503 Service Unavailable
+      const res2 = await fetch(`${limitedBaseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Authorization': 'Bearer atk_sandbox_session_2'
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'c2', version: '1.0' } },
+          id: 1
+        })
+      });
+      assert.equal(res2.status, 503);
+      const res2Body = await res2.json() as { status: number; title: string };
+      assert.equal(res2Body.status, 503);
+      assert.equal(res2Body.title, 'Service Unavailable');
+    } finally {
+      await limitedServer.close();
+    }
+  });
+
+  it('19. Session Idle Timeout: periodically sweeps and terminates idle sessions', async () => {
+    const idleServer = createMcpHttpServer({
+      environment: 'development',
+      sessionIdleTimeoutMs: 25 // 25ms timeout
+    });
+
+    await new Promise<void>((resolve) => {
+      idleServer.httpServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    const addr = idleServer.httpServer.address();
+    const port = typeof addr === 'object' && addr !== null ? addr.port : 0;
+    const idleBaseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      const initRes = await fetch(`${idleBaseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Authorization': 'Bearer atk_sandbox_idle_test'
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'idle-client', version: '1.0' } },
+          id: 1
+        })
+      });
+      assert.equal(initRes.status, 200);
+      const sessionId = initRes.headers.get('mcp-session-id')!;
+      assert.ok(sessionId);
+
+      // Wait 60ms to let idle timeout expire (25ms timeout)
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      // Attempting to use the idle session must fail with 404 session not found or expired
+      const followUpRes = await fetch(`${idleBaseUrl}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Mcp-Session-Id': sessionId,
+          'Authorization': 'Bearer atk_sandbox_idle_test'
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'tools/list',
+          id: 2
+        })
+      });
+
+      assert.equal(followUpRes.status, 404);
+    } finally {
+      await idleServer.close();
+    }
   });
 });

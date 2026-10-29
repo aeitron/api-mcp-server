@@ -13,6 +13,9 @@ export interface McpServerConfig {
   jwtSecret: string;
   corsAllowedOrigins: string[];
   allowSandbox: boolean;
+  sessionIdleTimeoutMs: number;
+  maxActiveSessions: number;
+  storageDir: string;
   rawApiKeys?: string;
   rawOAuthClients?: string;
 }
@@ -23,8 +26,10 @@ export function getConfig(): McpServerConfig {
 
   let rawEnv: string;
   if (rawAeitronEnv) {
-    // Conflict detection: if NODE_ENV is production but AEITRON_ENV claims development/test, fail closed
-    if ((nodeEnv === 'production' || nodeEnv === 'prod') && (rawAeitronEnv === 'development' || rawAeitronEnv === 'dev')) {
+    // Conflict detection: if NODE_ENV is production but AEITRON_ENV claims non-production (dev, test, etc.), fail closed
+    const isNodeProd = nodeEnv === 'production' || nodeEnv === 'prod';
+    const isAeitronProdLike = rawAeitronEnv === 'production' || rawAeitronEnv === 'prod' || rawAeitronEnv === 'staging' || rawAeitronEnv === 'stage';
+    if (isNodeProd && !isAeitronProdLike) {
       throw new Error(`FATAL CONFIGURATION ERROR: Conflicting environment configuration. NODE_ENV is 'production' but AEITRON_ENV is '${rawAeitronEnv}'. Explicitly align or configure AEITRON_ENV.`);
     }
     rawEnv = rawAeitronEnv;
@@ -86,6 +91,9 @@ export function getConfig(): McpServerConfig {
     jwtSecret,
     corsAllowedOrigins,
     allowSandbox,
+    sessionIdleTimeoutMs: parseInt(process.env.AEITRON_SESSION_IDLE_TIMEOUT_MS || '1800000', 10), // 30 minutes default
+    maxActiveSessions: parseInt(process.env.AEITRON_MAX_ACTIVE_SESSIONS || '100', 10),
+    storageDir: process.env.AEITRON_STORAGE_DIR || '',
     rawApiKeys: process.env.AEITRON_API_KEYS,
     rawOAuthClients: process.env.AEITRON_OAUTH_CLIENTS
   };

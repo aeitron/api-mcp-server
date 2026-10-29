@@ -2,6 +2,8 @@ node_modules/
 dist/
 *.log
 .env*
+.aeitron-state/
 .DS_Store
 Thumbs.db
+
 

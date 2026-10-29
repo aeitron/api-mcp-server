@@ -5,7 +5,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { createAeitronMcpServer } from '../src/server.js';
 import { AuditLogger } from '../src/audit.js';
 import { AuditRecord } from '../src/types.js';
-import { issueDnsDeletionChallenge } from '../src/auth.js';
+import { issueDnsDeletionChallenge, authorizeDnsDeletionRequest, createSignedTestJwt } from '../src/auth.js';
+import { handleDnsApproveDeletion } from '../src/cli.js';
 
 describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
   let client: Client;
@@ -288,6 +289,114 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     assert.equal(replayResult.isError, true);
     const replayContent = replayResult.content as Array<{ text: string }>;
     assert.ok(replayContent[0].text.includes('replay attempt detected'));
+  });
+
+  it('12b. End-to-End Human Operator Approval: dry run produces request ID, operator authorizes, deletion succeeds', async () => {
+    // 1. Tool returns deletion request ID
+    const dryRunResult = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_004',
+        dryRun: true
+      }
+    });
+
+    assert.equal(dryRunResult.isError, undefined);
+    const dryRunText = (dryRunResult.content as Array<{ text: string }>)[0].text;
+    const match = dryRunText.match(/del_req_[a-f0-9]+/);
+    assert.ok(match, 'Must contain del_req_ request ID');
+    const requestId = match[0];
+
+    // 2. Operator authorizes request via authorizeDnsDeletionRequest
+    const operatorApproval = authorizeDnsDeletionRequest(
+      {
+        actorId: 'usr_human_operator_42',
+        tenantId: 'tenant_customerAcme',
+        tier: 'enterprise',
+        scopes: ['dns:write:delete'],
+        livemode: true
+      },
+      requestId
+    );
+
+    assert.equal(operatorApproval.success, true);
+    if (!operatorApproval.success) return;
+    assert.ok(operatorApproval.token.startsWith('del_tok_'));
+
+    // 3. AI agent re-invokes deletion tool with the approval token
+    const deleteResult = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_004',
+        confirm: true,
+        approvalToken: operatorApproval.token
+      }
+    });
+
+    assert.equal(deleteResult.isError, undefined);
+    const deleteContent = (deleteResult.content as Array<{ text: string }>)[0].text;
+    assert.ok(deleteContent.includes('DNS Record Deleted Successfully'));
+
+    // 4. Attempting to authorize or consume the same request again must fail
+    const reApproval = authorizeDnsDeletionRequest(
+      {
+        actorId: 'usr_human_operator_42',
+        tenantId: 'tenant_customerAcme',
+        tier: 'enterprise',
+        scopes: ['dns:write:delete'],
+        livemode: true
+      },
+      requestId
+    );
+    assert.equal(reApproval.success, false);
+  });
+
+  it('12c. CLI Operator Approval: authorizes request using handleDnsApproveDeletion CLI workflow', async () => {
+    // 1. Tool triggers safety challenge
+    const challengeResult = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_005',
+        confirm: true
+      }
+    });
+
+    assert.equal(challengeResult.isError, true);
+    const challengeText = (challengeResult.content as Array<{ text: string }>)[0].text;
+    const match = challengeText.match(/del_req_[a-f0-9]+/);
+    assert.ok(match, 'Must contain del_req_ request ID');
+    const requestId = match[0];
+
+    // 2. Human operator runs CLI approval with operator token containing dns:write:delete
+    const operatorToken = createSignedTestJwt({
+      sub: 'usr_operator_cli_admin',
+      tenant_id: 'tenant_customerAcme',
+      scopes: ['dns:write:delete']
+    });
+
+    const cliResult = await handleDnsApproveDeletion({
+      requestId,
+      token: operatorToken
+    });
+
+    assert.equal(cliResult.success, true);
+    assert.ok(cliResult.token && cliResult.token.startsWith('del_tok_'));
+
+    // 3. Deletion succeeds with CLI-issued token
+    const executionResult = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_005',
+        confirm: true,
+        approvalToken: cliResult.token
+      }
+    });
+
+    assert.equal(executionResult.isError, undefined);
   });
 
   it('13. delete_dns_record: rejects invalid or forged approvalToken with 403 Forbidden', async () => {

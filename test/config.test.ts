@@ -38,6 +38,32 @@ describe('Environment & Docker Configuration Suite', () => {
     );
   });
 
+  it('2b. Fail-Closed on Conflict: NODE_ENV=production with AEITRON_ENV=test throws fatal error', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.AEITRON_ENV = 'test';
+
+    assert.throws(
+      () => getConfig(),
+      /Conflicting environment configuration/
+    );
+  });
+
+  it('2c. Fail-Closed on Conflict: NODE_ENV=production with AEITRON_ENV=testing or sandbox throws fatal error', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.AEITRON_ENV = 'testing';
+
+    assert.throws(
+      () => getConfig(),
+      /Conflicting environment configuration/
+    );
+
+    process.env.AEITRON_ENV = 'sandbox';
+    assert.throws(
+      () => getConfig(),
+      /Conflicting environment configuration/
+    );
+  });
+
   it('3. Fail-Closed on Staging: requires >=32 char secret and strictly disables sandbox', () => {
     process.env.AEITRON_ENV = 'staging';
     
@@ -76,3 +102,4 @@ describe('Environment & Docker Configuration Suite', () => {
     );
   });
 });
+

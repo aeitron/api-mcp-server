@@ -7,13 +7,16 @@ import {
   verifyAuthToken,
   checkToolAuthorization,
   createSignedTestJwt,
+  issueOAuthAccessToken,
   getOAuthDiscoveryMetadata,
   getJwksMetadata,
   registerAuthoritativeKeyForTesting,
+  registerHistoricalRsaKeyForTesting,
   clearTestRegistries,
   loadAuthoritativeKeysFromEnv,
   issueDnsDeletionChallenge,
-  verifyDnsDeletionChallenge
+  verifyDnsDeletionChallenge,
+  ACTIVE_KID
 } from '../src/auth.js';
 
 describe('OAuth & Cryptographic Token Verification Suite', () => {
@@ -341,10 +344,74 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
   it('returns compliant RFC 7517 JWKS metadata with valid RSA public key', () => {
     const jwks = getJwksMetadata();
     assert.ok(Array.isArray(jwks.keys));
-    assert.equal(jwks.keys.length, 1);
+    assert.ok(jwks.keys.length >= 1);
     assert.equal(jwks.keys[0].kty, 'RSA');
     assert.equal(jwks.keys[0].alg, 'RS256');
     assert.ok(typeof (jwks.keys[0] as Record<string, unknown>).n === 'string');
     assert.ok(typeof (jwks.keys[0] as Record<string, unknown>).e === 'string');
+  });
+
+  it('supports key rotation: exposes historical public keys in JWKS and verifies historical tokens', () => {
+    // Generate a separate historical RSA key pair
+    const oldPair = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+
+    const historicalKid = 'aeitron-mcp-rsa-historical-v0';
+    registerHistoricalRsaKeyForTesting(historicalKid, oldPair.publicKey);
+
+    // JWKS must now publish both keys
+    const jwks = getJwksMetadata();
+    const foundOldKey = jwks.keys.find((k) => k.kid === historicalKid);
+    assert.ok(foundOldKey, 'Historical key must be exposed in JWKS during rotation grace period');
+
+    // Create a token signed by the historical private key
+    const headerB64 = Buffer.from(JSON.stringify({
+      alg: 'RS256',
+      typ: 'JWT',
+      kid: historicalKid
+    })).toString('base64url');
+
+    const payloadB64 = Buffer.from(JSON.stringify({
+      iss: 'https://api.aeitron.com',
+      aud: 'aeitron-mcp',
+      sub: 'usr_historical_client',
+      tenant_id: 'tenant_legacy_org',
+      scopes: ['account:read'],
+      exp: Math.floor(Date.now() / 1000) + 1800
+    })).toString('base64url');
+
+    const content = `${headerB64}.${payloadB64}`;
+    const sig = crypto.createSign('RSA-SHA256').update(content).sign(oldPair.privateKey, 'base64url');
+    const historicalJwt = `${content}.${sig}`;
+
+    // Token signed with historical key must verify successfully
+    const authResult = verifyAuthToken(historicalJwt);
+    assert.equal(authResult.success, true);
+    if (authResult.success) {
+      assert.equal(authResult.claims.actorId, 'usr_historical_client');
+      assert.equal(authResult.claims.tenantId, 'tenant_legacy_org');
+    }
+  });
+
+  it('issueOAuthAccessToken: creates RFC 7519 RS256 token matching JWKS active kid', () => {
+    const token = issueOAuthAccessToken({
+      clientId: 'client_sample_123',
+      clientSecretHash: '',
+      tenantId: 'tenant_cloud_01',
+      actorId: 'usr_cloud_admin',
+      scopes: ['account:read', 'dns:write']
+    });
+
+    const [hB64, pB64] = token.split('.');
+    const header = JSON.parse(Buffer.from(hB64, 'base64url').toString('utf-8')) as { alg: string; kid: string };
+    assert.equal(header.alg, 'RS256');
+    assert.equal(header.kid, ACTIVE_KID);
+
+    // Verify token validity
+    const verified = verifyAuthToken(token);
+    assert.equal(verified.success, true);
   });
 });

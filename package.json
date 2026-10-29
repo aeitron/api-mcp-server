@@ -9,15 +9,15 @@
     "url": "https://github.com/aeitron/mcp-server.git"
   },
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
   "bin": {
-    "aeitron-mcp": "./dist/cli.js"
+    "aeitron-mcp": "./dist/src/cli.js"
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/cli.js",
-    "serve": "node dist/http.js",
+    "start": "node dist/src/cli.js",
+    "serve": "node dist/src/http.js",
     "typecheck": "tsc --noEmit",
     "test": "tsc && node --test dist/test/**/*.test.js"
   },

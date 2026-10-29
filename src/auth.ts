@@ -6,6 +6,8 @@
 
 import { IncomingMessage } from 'node:http';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { getConfig } from './config.js';
 
 export interface AuthClaims {
@@ -62,11 +64,37 @@ export interface OAuthClient {
 }
 
 /**
+ * Active Key ID for JWT signing and JWKS distribution
+ */
+export const ACTIVE_KID = process.env.AEITRON_JWT_KID || 'aeitron-mcp-rsa-2026-v1';
+
+/**
  * Registry of authoritative live API keys.
  * Zero hardcoded keys in production. Keys are loaded dynamically from environment or hashed store.
  */
 const AUTHORITATIVE_KEYS = new Map<string, RegisteredKey>();
 const OAUTH_CLIENTS = new Map<string, OAuthClient>();
+
+function getStorageDir(): string {
+  const config = getConfig();
+  const configured = (config.storageDir || process.env.AEITRON_STORAGE_DIR || '').trim();
+  if (configured) {
+    return configured;
+  }
+  return path.join(process.cwd(), '.aeitron-state');
+}
+
+function ensureStorageDir(): string {
+  const dir = getStorageDir();
+  try {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+  } catch {
+    // Fall through if file system is read-only or in constrained environment
+  }
+  return dir;
+}
 
 /**
  * Dynamically loads authoritative API keys from the AEITRON_API_KEYS environment variable.
@@ -133,15 +161,139 @@ export function loadOAuthClientsFromEnv(rawClients?: string): void {
 loadAuthoritativeKeysFromEnv();
 loadOAuthClientsFromEnv();
 
-// Asymmetric Key Pair for RFC 7517 compliant JWKS public key distribution and RS256 signing
-const RSA_KEY_PAIR = crypto.generateKeyPairSync('rsa', {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: 'spki', format: 'pem' },
-  privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
-});
+interface RsaKeyPair {
+  publicKey: string;
+  privateKey: string;
+}
 
-const RSA_PUBLIC_KEY_OBJ = crypto.createPublicKey(RSA_KEY_PAIR.publicKey);
-const RSA_PUBLIC_JWK = RSA_PUBLIC_KEY_OBJ.export({ format: 'jwk' });
+interface RegisteredPublicKey {
+  kid: string;
+  publicKeyPem: string;
+  keyObject: crypto.KeyObject;
+  jwk: Record<string, unknown>;
+  active: boolean;
+  addedAt: number;
+}
+
+const REGISTERED_PUBLIC_KEYS = new Map<string, RegisteredPublicKey>();
+
+// Asymmetric Key Pair for RFC 7517 compliant JWKS public key distribution and RS256 signing
+function loadOrGenerateRsaKeyPair(): RsaKeyPair {
+  // 1. Direct environment variable support (standard 12-factor / KMS / secret manager)
+  const envPrivate = process.env.AEITRON_RSA_PRIVATE_KEY || process.env.AEITRON_JWT_PRIVATE_KEY;
+  const envPublic = process.env.AEITRON_RSA_PUBLIC_KEY || process.env.AEITRON_JWT_PUBLIC_KEY;
+
+  if (envPrivate && envPublic) {
+    try {
+      crypto.createPrivateKey(envPrivate);
+      crypto.createPublicKey(envPublic);
+      return { privateKey: envPrivate, publicKey: envPublic };
+    } catch {
+      // If environment keys are malformed, fall through
+    }
+  }
+
+  // 2. Persistent Key File from AEITRON_RSA_KEY_FILE / AEITRON_JWT_KEY_FILE
+  const keyFilePath = process.env.AEITRON_RSA_KEY_FILE || process.env.AEITRON_JWT_KEY_FILE;
+  if (keyFilePath && fs.existsSync(keyFilePath)) {
+    try {
+      const fileContent = fs.readFileSync(keyFilePath, 'utf-8');
+      const parsed = JSON.parse(fileContent);
+      if (parsed.privateKey && parsed.publicKey) {
+        crypto.createPrivateKey(parsed.privateKey);
+        crypto.createPublicKey(parsed.publicKey);
+        return { privateKey: parsed.privateKey, publicKey: parsed.publicKey };
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  // 3. Persistent Local Storage Cache (preserves identical key pair across server restarts & multi-process CLI)
+  const stateDir = ensureStorageDir();
+  const cachedKeyFile = path.join(stateDir, 'aeitron-jwt-rsa.json');
+  try {
+    if (fs.existsSync(cachedKeyFile)) {
+      const cachedContent = fs.readFileSync(cachedKeyFile, 'utf-8');
+      const cached = JSON.parse(cachedContent);
+      if (cached.privateKey && cached.publicKey) {
+        crypto.createPrivateKey(cached.privateKey);
+        crypto.createPublicKey(cached.publicKey);
+        return { privateKey: cached.privateKey, publicKey: cached.publicKey };
+      }
+    }
+  } catch {
+    // Fall through
+  }
+
+  // 4. Generate new RSA-2048 key pair
+  const generated = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+  });
+
+  // Persist generated key pair to local storage cache if writable
+  try {
+    fs.writeFileSync(
+      cachedKeyFile,
+      JSON.stringify({ privateKey: generated.privateKey, publicKey: generated.publicKey, generatedAt: Date.now() }, null, 2),
+      { encoding: 'utf-8', mode: 0o600 }
+    );
+  } catch {
+    // Ignore write error if storage is non-writable
+  }
+
+  return generated;
+}
+
+const RSA_KEY_PAIR = loadOrGenerateRsaKeyPair();
+
+function registerPublicKey(kid: string, publicKeyPem: string, active: boolean): void {
+  try {
+    const keyObject = crypto.createPublicKey(publicKeyPem);
+    const jwk = keyObject.export({ format: 'jwk' });
+    REGISTERED_PUBLIC_KEYS.set(kid, {
+      kid,
+      publicKeyPem,
+      keyObject,
+      jwk,
+      active,
+      addedAt: Date.now()
+    });
+  } catch {
+    // Ignore malformed key registration
+  }
+}
+
+// Register primary active RSA public key
+registerPublicKey(ACTIVE_KID, RSA_KEY_PAIR.publicKey, true);
+
+// Load any historical rotated public keys from environment for graceful key rotation
+function loadHistoricalKeysFromEnv(): void {
+  const rawHistorical = process.env.AEITRON_HISTORICAL_PUBLIC_KEYS;
+  if (!rawHistorical) return;
+  try {
+    const parsed = JSON.parse(rawHistorical);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (item.kid && item.publicKey) {
+          registerPublicKey(item.kid, item.publicKey, false);
+        }
+      }
+    }
+  } catch {
+    // Fall through
+  }
+}
+loadHistoricalKeysFromEnv();
+
+/**
+ * Register a historical public key in-memory for testing key rotation
+ */
+export function registerHistoricalRsaKeyForTesting(kid: string, publicKeyPem: string): void {
+  registerPublicKey(kid, publicKeyPem, false);
+}
 
 // Pending deletion requests awaiting human operator approval
 export interface PendingDeletionRequest {
@@ -153,10 +305,76 @@ export interface PendingDeletionRequest {
   createdAt: number;
   expiresAt: number;
   authorized: boolean;
+  authorizedBy?: string;
+  authorizedAt?: number;
+  approvalToken?: string;
+  consumed?: boolean;
+  consumedAt?: number;
 }
 
 const PENDING_DELETION_REQUESTS = new Map<string, PendingDeletionRequest>();
 const CONSUMED_APPROVAL_TOKENS = new Set<string>();
+
+function getDnsStateFiles(): { reqFile: string; consumedFile: string } {
+  const dir = ensureStorageDir();
+  return {
+    reqFile: path.join(dir, 'dns-deletion-requests.json'),
+    consumedFile: path.join(dir, 'dns-consumed-tokens.json')
+  };
+}
+
+function loadDnsStateFromDisk(): void {
+  const { reqFile, consumedFile } = getDnsStateFiles();
+  try {
+    if (fs.existsSync(reqFile)) {
+      const data = JSON.parse(fs.readFileSync(reqFile, 'utf-8'));
+      if (Array.isArray(data)) {
+        const now = Date.now();
+        for (const item of data) {
+          if (item.requestId && item.expiresAt > now && !item.consumed) {
+            PENDING_DELETION_REQUESTS.set(item.requestId, item);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore read errors
+  }
+
+  try {
+    if (fs.existsSync(consumedFile)) {
+      const data = JSON.parse(fs.readFileSync(consumedFile, 'utf-8'));
+      if (Array.isArray(data)) {
+        for (const hash of data) {
+          if (typeof hash === 'string') {
+            CONSUMED_APPROVAL_TOKENS.add(hash);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore read errors
+  }
+}
+
+function saveDnsStateToDisk(): void {
+  const { reqFile, consumedFile } = getDnsStateFiles();
+  try {
+    const reqList = Array.from(PENDING_DELETION_REQUESTS.values());
+    fs.writeFileSync(reqFile, JSON.stringify(reqList, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  } catch {
+    // Ignore write errors
+  }
+  try {
+    const consumedList = Array.from(CONSUMED_APPROVAL_TOKENS);
+    fs.writeFileSync(consumedFile, JSON.stringify(consumedList, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  } catch {
+    // Ignore write errors
+  }
+}
+
+// Initial state load
+loadDnsStateFromDisk();
 
 /**
  * Exclusively for test suites to register test credentials in-memory.
@@ -190,6 +408,44 @@ export function clearTestRegistries(): void {
   OAUTH_CLIENTS.clear();
   PENDING_DELETION_REQUESTS.clear();
   CONSUMED_APPROVAL_TOKENS.clear();
+  try {
+    const { reqFile, consumedFile } = getDnsStateFiles();
+    if (fs.existsSync(reqFile)) fs.unlinkSync(reqFile);
+    if (fs.existsSync(consumedFile)) fs.unlinkSync(consumedFile);
+  } catch {
+    // Ignore cleanup errors in tests
+  }
+}
+
+/**
+ * Retrieves a pending DNS deletion request by ID (verifying TTL)
+ */
+export function getPendingDnsDeletionRequest(requestId: string): PendingDeletionRequest | undefined {
+  loadDnsStateFromDisk();
+  const req = PENDING_DELETION_REQUESTS.get(requestId);
+  if (req && Date.now() > req.expiresAt) {
+    PENDING_DELETION_REQUESTS.delete(requestId);
+    saveDnsStateToDisk();
+    return undefined;
+  }
+  return req;
+}
+
+/**
+ * Lists pending DNS deletion requests, optionally filtered by tenant ID
+ */
+export function listPendingDnsDeletionRequests(tenantId?: string): PendingDeletionRequest[] {
+  loadDnsStateFromDisk();
+  const now = Date.now();
+  const results: PendingDeletionRequest[] = [];
+  for (const req of PENDING_DELETION_REQUESTS.values()) {
+    if (req.expiresAt > now && !req.consumed) {
+      if (!tenantId || tenantId === 'anonymous' || req.tenantId === tenantId) {
+        results.push(req);
+      }
+    }
+  }
+  return results;
 }
 
 /**
@@ -240,11 +496,20 @@ export function verifyOAuthClient(
  * Automatically flags query parameters for audit warnings.
  */
 export function extractTokenFromRequest(
-  req: IncomingMessage,
+  req: IncomingMessage | Request | { headers: Record<string, string | string[] | undefined> | Headers },
   parsedUrl: URL
 ): { token?: string; wasInQuery: boolean } {
   // 1. Check Authorization header (Strongly preferred)
-  const authHeader = req.headers['authorization'];
+  let authHeader: string | undefined;
+  if ('headers' in req && req.headers) {
+    if (typeof (req.headers as Headers)?.get === 'function') {
+      authHeader = (req.headers as Headers).get('authorization') || undefined;
+    } else if (typeof req.headers === 'object') {
+      const h = (req.headers as Record<string, string | string[] | undefined>)['authorization'];
+      authHeader = Array.isArray(h) ? h[0] : h;
+    }
+  }
+
   if (authHeader) {
     const parts = authHeader.trim().split(/\s+/);
     if (parts.length === 2 && (parts[0].toLowerCase() === 'bearer' || parts[0].toLowerCase() === 'apikey')) {
@@ -343,7 +608,26 @@ export function verifyAuthToken(
       if (header.alg === 'RS256') {
         const verifier = crypto.createVerify('RSA-SHA256');
         verifier.update(content);
-        const valid = verifier.verify(RSA_KEY_PAIR.publicKey, sigB64, 'base64url');
+
+        let valid = false;
+        const kid = typeof header.kid === 'string' ? header.kid : undefined;
+        if (kid && REGISTERED_PUBLIC_KEYS.has(kid)) {
+          const keyMeta = REGISTERED_PUBLIC_KEYS.get(kid)!;
+          valid = verifier.verify(keyMeta.publicKeyPem, sigB64, 'base64url');
+        } else {
+          valid = verifier.verify(RSA_KEY_PAIR.publicKey, sigB64, 'base64url');
+          if (!valid) {
+            for (const keyMeta of REGISTERED_PUBLIC_KEYS.values()) {
+              const retryVerifier = crypto.createVerify('RSA-SHA256');
+              retryVerifier.update(content);
+              if (retryVerifier.verify(keyMeta.publicKeyPem, sigB64, 'base64url')) {
+                valid = true;
+                break;
+              }
+            }
+          }
+        }
+
         if (!valid) {
           return {
             success: false,
@@ -625,10 +909,11 @@ export function createDnsDeletionRequest(
   domain: string,
   recordId: string
 ): { requestId: string; expiresAt: number } {
+  loadDnsStateFromDisk();
   const requestId = `del_req_${crypto.randomBytes(16).toString('hex')}`;
   const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minute validity window
 
-  PENDING_DELETION_REQUESTS.set(requestId, {
+  const record: PendingDeletionRequest = {
     requestId,
     tenantId,
     actorId,
@@ -637,7 +922,10 @@ export function createDnsDeletionRequest(
     createdAt: Date.now(),
     expiresAt,
     authorized: false
-  });
+  };
+
+  PENDING_DELETION_REQUESTS.set(requestId, record);
+  saveDnsStateToDisk();
 
   return { requestId, expiresAt };
 }
@@ -649,7 +937,18 @@ export function authorizeDnsDeletionRequest(
   operatorClaims: AuthClaims,
   requestId: string,
   secret?: string
-): { success: true; token: string; expiresAt: number } | { success: false; error: string; status: number } {
+): {
+  success: true;
+  token: string;
+  expiresAt: number;
+  requestId: string;
+  domain: string;
+  recordId: string;
+} | {
+  success: false;
+  error: string;
+  status: number;
+} {
   if (!operatorClaims.scopes.includes('dns:write:delete') && !operatorClaims.scopes.includes('*')) {
     return {
       success: false,
@@ -658,21 +957,38 @@ export function authorizeDnsDeletionRequest(
     };
   }
 
+  loadDnsStateFromDisk();
   const req = PENDING_DELETION_REQUESTS.get(requestId);
   if (!req) {
     return { success: false, status: 404, error: 'Pending deletion request not found or expired.' };
   }
   if (Date.now() > req.expiresAt) {
     PENDING_DELETION_REQUESTS.delete(requestId);
+    saveDnsStateToDisk();
     return { success: false, status: 410, error: 'Pending deletion request has expired.' };
+  }
+  if (req.consumed) {
+    return { success: false, status: 410, error: 'Pending deletion request has already been executed/consumed.' };
   }
   if (operatorClaims.tenantId !== 'anonymous' && req.tenantId !== operatorClaims.tenantId) {
     return { success: false, status: 403, error: 'Operator tenant does not match deletion request tenant.' };
   }
 
+  const challenge = createAuthorizedDnsDeletionToken(req.tenantId, req.domain, req.recordId, req.requestId, secret);
   req.authorized = true;
-  const challenge = createAuthorizedDnsDeletionToken(req.tenantId, req.domain, req.recordId, secret);
-  return { success: true, token: challenge.token, expiresAt: challenge.expiresAt };
+  req.authorizedBy = operatorClaims.actorId;
+  req.authorizedAt = Date.now();
+  req.approvalToken = challenge.token;
+  saveDnsStateToDisk();
+
+  return {
+    success: true,
+    token: challenge.token,
+    expiresAt: challenge.expiresAt,
+    requestId: req.requestId,
+    domain: req.domain,
+    recordId: req.recordId
+  };
 }
 
 /**
@@ -682,8 +998,9 @@ export function createAuthorizedDnsDeletionToken(
   tenantId: string,
   domain: string,
   recordId: string,
+  requestId?: string,
   secret?: string
-): { token: string; expiresAt: number } {
+): { token: string; expiresAt: number; requestId?: string } {
   const config = getConfig();
   const signingSecret = secret || config.jwtSecret;
   const expiresAt = Date.now() + 5 * 60 * 1000;
@@ -691,6 +1008,7 @@ export function createAuthorizedDnsDeletionToken(
 
   const payload = JSON.stringify({
     action: 'dns_delete_challenge',
+    requestId,
     tenantId,
     domain,
     recordId,
@@ -706,12 +1024,18 @@ export function createAuthorizedDnsDeletionToken(
 
   return {
     token: `del_tok_${payloadB64}.${signature}`,
-    expiresAt
+    expiresAt,
+    requestId
   };
 }
 
 // Backwards-compatible alias for existing tests
-export const issueDnsDeletionChallenge = createAuthorizedDnsDeletionToken;
+export const issueDnsDeletionChallenge = (
+  tenantId: string,
+  domain: string,
+  recordId: string,
+  secret?: string
+) => createAuthorizedDnsDeletionToken(tenantId, domain, recordId, undefined, secret);
 
 /**
  * Verifies and atomically consumes a DNS deletion approval challenge token.
@@ -728,6 +1052,7 @@ export function verifyAndConsumeDnsDeletionApproval(
     return { valid: false, error: 'Invalid challenge token format. Expected "del_tok_..." token.' };
   }
 
+  loadDnsStateFromDisk();
   const tokenHash = crypto.createHash('sha256').update(challengeToken).digest('hex');
   if (CONSUMED_APPROVAL_TOKENS.has(tokenHash)) {
     return { valid: false, error: 'Approval token has already been consumed (replay attempt detected).' };
@@ -770,8 +1095,21 @@ export function verifyAndConsumeDnsDeletionApproval(
       return { valid: false, error: 'Challenge approval token tenant mismatch.' };
     }
 
+    // If bound to a specific request ID, atomically mark that request as consumed
+    if (payload.requestId) {
+      const req = PENDING_DELETION_REQUESTS.get(payload.requestId);
+      if (req) {
+        if (req.consumed) {
+          return { valid: false, error: 'Approval token request has already been consumed (replay attempt detected).' };
+        }
+        req.consumed = true;
+        req.consumedAt = Date.now();
+      }
+    }
+
     // Atomically consume token to prevent replay
     CONSUMED_APPROVAL_TOKENS.add(tokenHash);
+    saveDnsStateToDisk();
     return { valid: true };
   } catch {
     return { valid: false, error: 'Failed to decode challenge token payload.' };
@@ -782,22 +1120,62 @@ export function verifyAndConsumeDnsDeletionApproval(
 export const verifyDnsDeletionChallenge = verifyAndConsumeDnsDeletionApproval;
 
 /**
+ * Issues an RFC 7519 / RFC 7517 compliant OAuth 2.0 access token
+ * signed with RS256 using the active RSA private key and kid.
+ */
+export function issueOAuthAccessToken(client: OAuthClient): string {
+  return createSignedTestJwt(
+    {
+      sub: client.actorId,
+      tenant_id: client.tenantId,
+      scopes: client.scopes
+    },
+    { algorithm: 'RS256', kid: ACTIVE_KID }
+  );
+}
+
+/**
  * Helper to generate cryptographically signed test JWTs for testing & OAuth flows.
  * Supports both standard symmetric HS256 and asymmetric RS256 signing.
  */
 export function createSignedTestJwt(
   payload: Record<string, unknown>,
-  options?: { secret?: string; algorithm?: 'HS256' | 'RS256' } | string
+  options?: { secret?: string; algorithm?: 'HS256' | 'RS256'; kid?: string } | string
 ): string {
   const config = getConfig();
-  const secret = typeof options === 'string' ? options : options?.secret;
-  const alg = (typeof options === 'object' && options?.algorithm) || 'HS256';
-  const signingSecret = secret || config.jwtSecret;
+  let alg: 'HS256' | 'RS256' = 'RS256';
+  let signingSecret: string = config.jwtSecret;
+  let kid: string | undefined = ACTIVE_KID;
+
+  if (typeof options === 'string') {
+    if (options === 'RS256' || options === 'HS256') {
+      alg = options;
+      if (alg === 'HS256') kid = undefined;
+    } else {
+      alg = 'HS256';
+      signingSecret = options;
+      kid = undefined;
+    }
+  } else if (typeof options === 'object' && options !== null) {
+    if (options.algorithm) {
+      alg = options.algorithm;
+    } else if (options.secret) {
+      alg = 'HS256';
+    }
+    if (options.secret) {
+      signingSecret = options.secret;
+    }
+    if (options.kid) {
+      kid = options.kid;
+    } else if (alg === 'HS256') {
+      kid = undefined;
+    }
+  }
 
   const headerB64 = Buffer.from(JSON.stringify({
     alg,
     typ: 'JWT',
-    kid: alg === 'RS256' ? 'aeitron-mcp-rsa-2026-v1' : undefined
+    kid: alg === 'RS256' ? (kid || ACTIVE_KID) : undefined
   })).toString('base64url');
 
   const defaultPayload: Record<string, unknown> = {
@@ -868,16 +1246,16 @@ export function getOAuthDiscoveryMetadata(publicBaseUrl: string): Record<string,
  * Returns RFC 7517 compliant JSON Web Key Set (JWKS) metadata with real RSA public key
  */
 export function getJwksMetadata(): { keys: Array<Record<string, unknown>> } {
-  return {
-    keys: [
-      {
-        kty: 'RSA',
-        use: 'sig',
-        alg: 'RS256',
-        kid: 'aeitron-mcp-rsa-2026-v1',
-        n: RSA_PUBLIC_JWK.n,
-        e: RSA_PUBLIC_JWK.e
-      }
-    ]
-  };
+  const keys: Array<Record<string, unknown>> = [];
+  for (const [kid, entry] of REGISTERED_PUBLIC_KEYS.entries()) {
+    keys.push({
+      kty: 'RSA',
+      use: 'sig',
+      alg: 'RS256',
+      kid,
+      n: entry.jwk.n,
+      e: entry.jwk.e
+    });
+  }
+  return { keys };
 }
