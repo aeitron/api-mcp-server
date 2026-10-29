@@ -23,6 +23,7 @@ import {
   verifyOAuthClient,
   registerOAuthClientForTesting,
   authorizeDnsDeletionRequest,
+  getDnsDeletionRequest,
   getPendingDnsDeletionRequest,
   listPendingDnsDeletionRequests,
   toRedactedDnsRequestDto,
@@ -77,6 +78,26 @@ export function createMcpHttpServer(
   }
   function releaseSessionSlot(): void {
     pendingSessionCreations = Math.max(0, pendingSessionCreations - 1);
+  }
+
+  // In-memory token bucket rate limiter for sensitive endpoints
+  const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+  function checkRateLimit(key: string, capacity = 60, refillPerSec = 1): boolean {
+    const now = Date.now();
+    let bucket = rateLimitBuckets.get(key);
+    if (!bucket) {
+      bucket = { tokens: capacity - 1, lastRefill: now };
+      rateLimitBuckets.set(key, bucket);
+      return true;
+    }
+    const elapsed = (now - bucket.lastRefill) / 1000;
+    bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * refillPerSec);
+    bucket.lastRefill = now;
+    if (bucket.tokens >= 1) {
+      bucket.tokens -= 1;
+      return true;
+    }
+    return false;
   }
 
   const startTime = Date.now();
@@ -187,6 +208,14 @@ export function createMcpHttpServer(
   // 5. Authenticated OAuth 2.0 Token Exchange Endpoint
   // Enforces client authentication (Basic Auth or JSON body) — zero unauthenticated tokens!
   app.post('/v1/auth/token', async (c) => {
+    const clientIp = c.req.header('x-forwarded-for')?.split(',')[0].trim() || 'local';
+    if (!checkRateLimit(`auth_token:${clientIp}`, 100, 5)) {
+      return c.json({
+        error: 'slow_down',
+        error_description: 'Rate limit exceeded on token endpoint. Please wait before retrying.'
+      }, 429);
+    }
+
     let clientId: string | undefined;
     let clientSecret: string | undefined;
 
@@ -267,6 +296,13 @@ export function createMcpHttpServer(
         error: 'unauthorized',
         error_description: auth.error
       }, auth.status);
+    }
+
+    if (!checkRateLimit(`dns_approve:${auth.claims.tenantId}`, 60, 2)) {
+      return c.json({
+        error: 'rate_limit_exceeded',
+        error_description: 'Rate limit exceeded on DNS deletion approvals for this tenant.'
+      }, 429);
     }
 
     const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
@@ -362,7 +398,7 @@ export function createMcpHttpServer(
     }
 
     const reqId = c.req.param('id');
-    const request = getPendingDnsDeletionRequest(reqId);
+    const request = getDnsDeletionRequest(reqId);
     const tenantId = auth.claims.tenantId;
     if (!request || !tenantId || tenantId === 'anonymous' || request.tenantId !== tenantId) {
       return c.json({ error: 'not_found', error_description: 'Deletion request not found or expired.' }, 404);
@@ -380,17 +416,40 @@ export function createMcpHttpServer(
     const auth = verifyAuthToken(rawToken, {
       isProduction: config.environment === 'production',
       allowSandbox: config.allowSandbox,
-      jwtSecret: config.jwtSecret,
-      requiredScopes: ['dns:delete:approve']
+      jwtSecret: config.jwtSecret
     });
 
     if (!auth.success) {
       return c.json({ error: 'unauthorized', error_description: auth.error }, auth.status);
     }
 
+    // Explicit Dual-Scope Authorization: Reconciliation requires both approval and DNS read privileges
+    const hasApproveScope =
+      auth.claims.scopes.includes('dns:delete:approve') ||
+      auth.claims.scopes.includes('*');
+    const hasReadScope =
+      auth.claims.scopes.includes('dns:read') ||
+      auth.claims.scopes.includes('dns:write') ||
+      auth.claims.scopes.includes('*');
+
+    if (!hasApproveScope || !hasReadScope) {
+      return c.json({
+        error: 'forbidden',
+        error_description: 'Access denied: Reconciliation requires both "dns:delete:approve" and "dns:read" scopes.'
+      }, 403);
+    }
+
     const reqId = c.req.param('id');
-    const request = getPendingDnsDeletionRequest(reqId);
     const tenantId = auth.claims.tenantId;
+
+    if (!checkRateLimit(`dns_reconcile:${tenantId}`, 60, 2)) {
+      return c.json({
+        error: 'rate_limit_exceeded',
+        error_description: 'Rate limit exceeded on DNS deletion reconciliation for this tenant.'
+      }, 429);
+    }
+
+    const request = getDnsDeletionRequest(reqId);
     if (!request || !tenantId || tenantId === 'anonymous' || request.tenantId !== tenantId) {
       return c.json({ error: 'not_found', error_description: 'Deletion request not found or expired.' }, 404);
     }
@@ -414,9 +473,12 @@ export function createMcpHttpServer(
         recordStillExists
       });
     } catch (err: unknown) {
+      process.stderr.write(
+        `[aeitron-mcp] DNS reconciliation failed for request ${reqId}: ${err instanceof Error ? err.message : String(err)}\n`
+      );
       return c.json({
         error: 'reconciliation_failed',
-        error_description: `Failed to query live zone records: ${err instanceof Error ? err.message : String(err)}`
+        error_description: 'Unable to verify the deletion outcome. The request remains unresolved; retry reconciliation.'
       }, 502);
     }
   });

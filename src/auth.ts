@@ -401,21 +401,28 @@ function acquireDnsStateLock(): () => void {
       if (code === 'EEXIST' || code === 'EBUSY') {
         try {
           if (fs.existsSync(lockPath)) {
-            const content = fs.readFileSync(lockPath, 'utf-8');
-            const data = JSON.parse(content);
-            const isProcessDead = (() => {
-              if (typeof data.pid !== 'number') return true;
-              try {
-                process.kill(data.pid, 0);
-                return false;
-              } catch (killErr: any) {
-                return killErr?.code === 'ESRCH';
+            let isProcessDead = false;
+            try {
+              const content = fs.readFileSync(lockPath, 'utf-8');
+              const data = JSON.parse(content);
+              if (typeof data.pid !== 'number') {
+                isProcessDead = true;
+              } else {
+                try {
+                  process.kill(data.pid, 0);
+                  isProcessDead = false;
+                } catch (killErr: any) {
+                  isProcessDead = killErr?.code === 'ESRCH';
+                }
               }
-            })();
+            } catch {
+              // Corrupt or unparseable lock file - safe to reclaim
+              isProcessDead = true;
+            }
 
-            const isStale = typeof data.createdAt === 'number' && (Date.now() - data.createdAt > 30000);
-
-            if (isProcessDead || isStale) {
+            // Strictly reclaim only when the holding process is confirmed dead.
+            // Do not delete active locks based solely on elapsed time.
+            if (isProcessDead) {
               try {
                 fs.unlinkSync(lockPath);
               } catch {}
@@ -625,9 +632,21 @@ function loadDnsStateFromDisk(): void {
       const raw = JSON.parse(content);
       const data = validateDnsStatePayload(raw);
       const now = Date.now();
+      const RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days retention for audit & operational tracking
       for (const item of data.requests) {
-        if (item.requestId && item.expiresAt > now && item.status !== 'completed' && item.status !== 'failed') {
+        if (!item.requestId) continue;
+        const isTerminal = item.status === 'completed' || item.status === 'failed';
+        if (!isTerminal && item.expiresAt > now) {
           PENDING_DELETION_REQUESTS.set(item.requestId, item);
+        } else if (isTerminal) {
+          const terminalTime = item.completedAt || item.expiresAt || item.createdAt;
+          if (now - terminalTime < RETENTION_MS) {
+            PENDING_DELETION_REQUESTS.set(item.requestId, item);
+          }
+        } else if (item.status === 'execution_unknown') {
+          if (now - item.createdAt < RETENTION_MS) {
+            PENDING_DELETION_REQUESTS.set(item.requestId, item);
+          }
         }
       }
       for (const hash of data.consumedTokenHashes) {
@@ -748,19 +767,28 @@ export function clearTestRegistries(): void {
 }
 
 /**
- * Retrieves a pending DNS deletion request by ID (verifying TTL)
+ * Retrieves any DNS deletion request by ID from disk state (including historical terminal requests).
+ * Retains records within the 30-day operational retention window.
  */
-export function getPendingDnsDeletionRequest(requestId: string): PendingDeletionRequest | undefined {
+export function getDnsDeletionRequest(requestId: string): PendingDeletionRequest | undefined {
   return withDnsStateLock(() => {
     loadDnsStateFromDisk();
-    const req = PENDING_DELETION_REQUESTS.get(requestId);
-    if (req && Date.now() > req.expiresAt) {
-      PENDING_DELETION_REQUESTS.delete(requestId);
-      saveDnsStateToDisk();
-      return undefined;
-    }
-    return req;
+    return PENDING_DELETION_REQUESTS.get(requestId);
   });
+}
+
+/**
+ * Retrieves a pending DNS deletion request awaiting operator action (verifying pending state & TTL).
+ */
+export function getPendingDnsDeletionRequest(requestId: string): PendingDeletionRequest | undefined {
+  const req = getDnsDeletionRequest(requestId);
+  if (!req || req.status !== 'pending') {
+    return undefined;
+  }
+  if (Date.now() > req.expiresAt) {
+    return undefined;
+  }
+  return req;
 }
 
 /**
@@ -1247,6 +1275,19 @@ export function createDnsDeletionRequest(
   domain: string,
   recordId: string
 ): { requestId: string; expiresAt: number } {
+  if (
+    !tenantId ||
+    !tenantId.trim() ||
+    tenantId.trim().toLowerCase() === 'anonymous' ||
+    !actorId ||
+    !actorId.trim()
+  ) {
+    throw new Error('Cannot create a DNS deletion request without a valid tenant and actor.');
+  }
+  if (!domain || !domain.trim() || !recordId || !recordId.trim()) {
+    throw new Error('Cannot create a DNS deletion request without a valid domain and recordId.');
+  }
+
   return withDnsStateLock(() => {
     loadDnsStateFromDisk();
     const requestId = `del_req_${crypto.randomBytes(16).toString('hex')}`;
@@ -1632,7 +1673,9 @@ export function reconcileDnsDeletionStatus(
         req.status = 'completed';
         req.completedAt = Date.now();
       } else {
-        req.status = 'failed';
+        // Safe Reconciliation: Do not mark failed prematurely if record still exists;
+        // keep in execution_unknown so operator can re-check live state once upstream settles.
+        req.status = 'execution_unknown';
       }
       saveDnsStateToDisk();
       return { success: true, status: req.status };
@@ -1642,17 +1685,58 @@ export function reconcileDnsDeletionStatus(
 }
 
 export function isStorageReady(): boolean {
+  let probePath: string | undefined;
+  let fd: number | undefined;
   try {
     const dir = ensureStorageDir();
-    return fs.existsSync(dir);
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      return false;
+    }
+    probePath = path.join(dir, `.ready-${process.pid}-${crypto.randomUUID()}`);
+    fd = fs.openSync(probePath, 'wx', 0o600);
+    fs.writeSync(fd, 'ready');
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.unlinkSync(probePath);
+    probePath = undefined;
+    return true;
   } catch {
     return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    if (probePath) {
+      try {
+        fs.unlinkSync(probePath);
+      } catch {}
+    }
   }
 }
 
 export function isRsaReady(): boolean {
   try {
-    return REGISTERED_PUBLIC_KEYS.size > 0 && Boolean(ACTIVE_KID);
+    if (REGISTERED_PUBLIC_KEYS.size === 0 || !ACTIVE_KID) {
+      return false;
+    }
+    const pubEntry = REGISTERED_PUBLIC_KEYS.get(ACTIVE_KID);
+    if (!pubEntry || !RSA_KEY_PAIR.privateKey) {
+      return false;
+    }
+
+    // Cryptographic self-test: sign test digest and verify with registered public key
+    const testData = Buffer.from(`rsa-readiness-test-${Date.now()}`);
+    const sign = crypto.createSign('SHA256');
+    sign.update(testData);
+    sign.end();
+    const signature = sign.sign(RSA_KEY_PAIR.privateKey);
+
+    const verify = crypto.createVerify('SHA256');
+    verify.update(testData);
+    verify.end();
+    return verify.verify(pubEntry.keyObject, signature);
   } catch {
     return false;
   }

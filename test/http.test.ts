@@ -819,25 +819,42 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     assert.strictEqual(legitData.request['approvalToken'], undefined);
   });
 
-  it('29. DNS Deletion Reconciliation: reconciles execution_unknown request with live zone records', async () => {
+  it('29. DNS Deletion Reconciliation: enforces dual-scope policy and reconciles execution_unknown', async () => {
     const req = createDnsDeletionRequest('tenant_test_workspace', 'usr_creator', 'example.com', 'rec_reconcile_1');
     markDnsDeletionExecutionUnknown(req.requestId, 'Upstream timeout simulated');
 
-    const operatorToken = createSignedTestJwt({
+    // 1. Operator with approval-only scope (missing dns:read) strictly rejected with 403
+    const approvalOnlyToken = createSignedTestJwt({
       tenant_id: 'tenant_test_workspace',
-      sub: 'usr_operator_recon',
+      sub: 'usr_operator_recon_single',
       scopes: ['dns:delete:approve']
+    });
+
+    const resForbidden = await fetch(`${baseUrl}/v1/dns/deletion-requests/${req.requestId}/reconcile`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${approvalOnlyToken}` }
+    });
+    assert.equal(resForbidden.status, 403);
+    const forbiddenBody = await resForbidden.json() as { error: string; error_description: string };
+    assert.equal(forbiddenBody.error, 'forbidden');
+    assert.ok(forbiddenBody.error_description.includes('both "dns:delete:approve" and "dns:read" scopes'));
+
+    // 2. Operator with dual scopes (dns:delete:approve and dns:read) succeeds
+    const dualScopeToken = createSignedTestJwt({
+      tenant_id: 'tenant_test_workspace',
+      sub: 'usr_operator_recon_dual',
+      scopes: ['dns:delete:approve', 'dns:read']
     });
 
     const res = await fetch(`${baseUrl}/v1/dns/deletion-requests/${req.requestId}/reconcile`, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${operatorToken}` }
+      headers: { 'Authorization': `Bearer ${dualScopeToken}` }
     });
     assert.equal(res.status, 200);
     const data = await res.json() as { success: boolean; status: string; requestId: string };
     assert.equal(data.success, true);
     assert.equal(data.requestId, req.requestId);
-    assert.ok(data.status === 'completed' || data.status === 'failed');
+    assert.ok(data.status === 'completed' || data.status === 'execution_unknown');
   });
 
   it('30. GET /ready: verifies cryptographic and storage subsystem readiness checks', async () => {
@@ -847,5 +864,27 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     assert.equal(body.ready, true);
     assert.equal(body.checks.rsa, 'ok');
     assert.equal(body.checks.storage, 'ok');
+  });
+
+  it('31. Rate Limiting: throttles excessive requests on sensitive endpoints with 429', async () => {
+    // Generate burst of requests to /v1/auth/token from a single client
+    let hitRateLimit = false;
+    for (let i = 0; i < 110; i++) {
+      const res = await fetch(`${baseUrl}/v1/auth/token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '198.51.100.99'
+        },
+        body: JSON.stringify({ grant_type: 'client_credentials' })
+      });
+      if (res.status === 429) {
+        hitRateLimit = true;
+        const body = await res.json() as { error: string };
+        assert.equal(body.error, 'slow_down');
+        break;
+      }
+    }
+    assert.equal(hitRateLimit, true, 'Rate limiter must return 429 when capacity is exceeded');
   });
 });

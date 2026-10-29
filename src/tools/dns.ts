@@ -6,7 +6,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { AeitronApiClient } from '../client.js';
+import { AeitronApiClient, AeitronApiError } from '../client.js';
 import { AuditLogger } from '../audit.js';
 import {
   AuthClaims,
@@ -17,6 +17,23 @@ import {
   markDnsDeletionFailed,
   markDnsDeletionExecutionUnknown
 } from '../auth.js';
+
+/**
+ * Classifies whether an upstream deletion failure is ambiguous (network/gateway 5xx/timeout)
+ * requiring execution_unknown state, or a confirmed definitive failure.
+ */
+export const isAmbiguousUpstreamFailure = (err: unknown): boolean => {
+  if (err instanceof AeitronApiError) {
+    return err.code === 'SERVICE_UNAVAILABLE' || err.status >= 500;
+  }
+  if (err instanceof Error) {
+    return (
+      (err as any).name === 'AbortError' ||
+      /timed out|network error|fetch failed|ECONNRESET|EPIPE|socket/i.test(err.message)
+    );
+  }
+  return false;
+};
 
 export function registerDnsTools(
   server: McpServer,
@@ -245,10 +262,45 @@ export function registerDnsTools(
         };
       }
 
-      const tenantId = authClaims?.tenantId || 'anonymous';
-      const actorId = authClaims?.actorId || 'anonymous_user';
+      // 2. Validate tenant and actor identity (no anonymous fallback allowed for destructive mutations)
+      const tenantId = authClaims?.tenantId;
+      const actorId = authClaims?.actorId;
+      if (
+        !tenantId ||
+        tenantId.trim().toLowerCase() === 'anonymous' ||
+        !actorId ||
+        !actorId.trim()
+      ) {
+        audit.logToolExecution('delete_dns_record', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, 'Anonymous tenant or missing actor strictly prohibited from DNS deletion');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: 'Forbidden: A valid authenticated tenant and actor are required for DNS deletion.'
+            }
+          ]
+        };
+      }
 
-      // 2. Handle Dry Run Preview
+      // Domain format validation
+      const domainRegex = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
+      if (!domainRegex.test(args.domain)) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `Invalid domain format: '${args.domain}'. Must be a valid fully-qualified domain name (e.g., 'aeitron.com').`
+            }
+          ]
+        };
+      }
+
+      // 3. Handle Dry Run Preview
       if (args.dryRun === true) {
         const req = createDnsDeletionRequest(tenantId, actorId, args.domain, args.recordId);
         audit.logToolExecution('delete_dns_record_preview', args, 0, true, {
@@ -374,12 +426,9 @@ export function registerDnsTools(
           ]
         };
       } catch (err: unknown) {
-        const isTimeout =
-          (err as any)?.status === 504 ||
-          (err as any)?.name === 'AbortError' ||
-          (err instanceof Error && /timed out/i.test(err.message));
+        const ambiguous = isAmbiguousUpstreamFailure(err);
 
-        if (isTimeout) {
+        if (ambiguous) {
           markDnsDeletionExecutionUnknown(tokenVerification.requestId, err instanceof Error ? err.message : String(err));
         } else {
           markDnsDeletionFailed(tokenVerification.requestId);
@@ -387,18 +436,18 @@ export function registerDnsTools(
 
         const duration = Date.now() - startTime;
         audit.logToolExecution('delete_dns_record', args, duration, false, {
-          tenantId: authClaims?.tenantId,
-          actorId: authClaims?.actorId
+          tenantId,
+          actorId
         }, err);
 
-        if (isTimeout) {
+        if (ambiguous) {
           return {
             isError: true,
             content: [
               {
                 type: 'text',
                 text: [
-                  `⚠️ UPSTREAM TIMEOUT: Deletion request timed out while communicating with edge gateway.`,
+                  `⚠️ AMBIGUOUS UPSTREAM FAILURE: Network or gateway error occurred while deleting DNS record.`,
                   `- **Request ID:** \`${tokenVerification.requestId}\``,
                   `- **Status:** \`execution_unknown\` (state locked against race conditions)`,
                   `- **Impact:** The upstream DNS record deletion may have been applied or may have failed.`,

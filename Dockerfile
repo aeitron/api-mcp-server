@@ -9,7 +9,7 @@ RUN npm ci
 COPY src/ ./src/
 
 RUN npm run build
-RUN npm prune --production
+RUN npm prune --omit=dev
 
 # Stage 2: Production Minimal Runtime
 FROM node:22-alpine AS runner

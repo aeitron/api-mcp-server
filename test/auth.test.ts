@@ -18,6 +18,8 @@ import {
   verifyDnsDeletionChallenge,
   verifyRsaKeyPairMatch,
   createDnsDeletionRequest,
+  getDnsDeletionRequest,
+  getPendingDnsDeletionRequest,
   authorizeDnsDeletionRequest,
   createAuthorizedDnsDeletionToken,
   loadOrGenerateRsaKeyPair,
@@ -793,12 +795,69 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     assert.equal(reconcileSuccess.success, true);
     assert.equal(reconcileSuccess.status, 'completed');
 
-    // Reconcile a failed timeout (record still present)
+    // Reconcile a failed timeout (record still present: safe interim state keeps execution_unknown)
     const req2 = createDnsDeletionRequest('tenant_timeout_test', 'usr_client', 'example.com', 'rec_timeout_2');
     markDnsDeletionExecutionUnknown(req2.requestId, 'Connection reset by peer');
     const reconcileFailed = reconcileDnsDeletionStatus(req2.requestId, true);
     assert.equal(reconcileFailed.success, true);
-    assert.equal(reconcileFailed.status, 'failed');
+    assert.equal(reconcileFailed.status, 'execution_unknown');
+  });
+
+  it('createDnsDeletionRequest strictly rejects anonymous or empty tenant and actor', () => {
+    // 1. anonymous tenant
+    assert.throws(
+      () => createDnsDeletionRequest('anonymous', 'usr_1', 'example.com', 'rec_1'),
+      /without a valid tenant and actor/
+    );
+
+    // 2. empty tenant
+    assert.throws(
+      () => createDnsDeletionRequest('', 'usr_1', 'example.com', 'rec_1'),
+      /without a valid tenant and actor/
+    );
+
+    // 3. empty actor
+    assert.throws(
+      () => createDnsDeletionRequest('tenant_valid', '', 'example.com', 'rec_1'),
+      /without a valid tenant and actor/
+    );
+
+    // 4. empty domain or recordId
+    assert.throws(
+      () => createDnsDeletionRequest('tenant_valid', 'usr_valid', '', 'rec_1'),
+      /without a valid domain and recordId/
+    );
+  });
+
+  it('getDnsDeletionRequest retains terminal requests (completed, failed) across state reloads', () => {
+    const req = createDnsDeletionRequest('tenant_history_test', 'usr_client_1', 'example.com', 'rec_history_1');
+    assert.ok(req.requestId);
+
+    // Authorize & complete
+    const authRes = authorizeDnsDeletionRequest(
+      {
+        actorId: 'usr_operator_hist',
+        tenantId: 'tenant_history_test',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false
+      },
+      req.requestId
+    );
+    assert.equal(authRes.success, true);
+    if (!authRes.success) return;
+
+    verifyDnsDeletionChallenge(authRes.token, 'tenant_history_test', 'example.com', 'rec_history_1');
+    markDnsDeletionCompleted(req.requestId);
+
+    // 1. getDnsDeletionRequest returns completed record
+    const loadedReq = getDnsDeletionRequest(req.requestId);
+    assert.ok(loadedReq);
+    assert.equal(loadedReq.status, 'completed');
+
+    // 2. getPendingDnsDeletionRequest strictly returns undefined for non-pending requests
+    const pendingReq = getPendingDnsDeletionRequest(req.requestId);
+    assert.equal(pendingReq, undefined);
   });
 
   it('validateDnsStatePayload: rejects invalid timestamps, non-boolean authorized, and invalid statuses', () => {

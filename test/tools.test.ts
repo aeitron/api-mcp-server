@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { createAeitronMcpServer } from '../src/server.js';
+import { AeitronApiError } from '../src/client.js';
 import { AuditLogger } from '../src/audit.js';
 import { AuditRecord } from '../src/types.js';
 import {
   issueDnsDeletionChallenge,
   authorizeDnsDeletionRequest,
   createSignedTestJwt,
+  getDnsDeletionRequest,
   getPendingDnsDeletionRequest
 } from '../src/auth.js';
 import { handleDnsApproveDeletion } from '../src/cli.js';
@@ -545,16 +547,136 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
 
     assert.equal(result.isError, true);
     const content = (result.content as Array<{ text: string }>)[0].text;
-    assert.ok(content.includes('UPSTREAM TIMEOUT'));
+    assert.ok(content.includes('AMBIGUOUS UPSTREAM FAILURE'));
     assert.ok(content.includes('execution_unknown'));
     assert.ok(content.includes('reconcile'));
 
     // Verify request in state is indeed execution_unknown
-    const stateReq = getPendingDnsDeletionRequest(challenge.requestId);
+    const stateReq = getDnsDeletionRequest(challenge.requestId);
     assert.ok(stateReq);
     assert.equal(stateReq.status, 'execution_unknown');
 
     await timeoutMcpClient.close();
     await timeoutServer.server.close();
+  });
+
+  it('16. delete_dns_record: upstream definitive 404 rejection transitions request to failed status', async () => {
+    const notFoundClient = {
+      deleteDnsRecord: async () => {
+        throw new AeitronApiError('DNS record not found in specified zone', 404, 'RECORD_NOT_FOUND');
+      }
+    } as any;
+
+    const notFoundServer = createAeitronMcpServer({
+      client: notFoundClient,
+      authClaims: {
+        tenantId: 'tenant_customerAcme',
+        actorId: 'usr_live_acme_admin',
+        tier: 'enterprise',
+        scopes: ['dns:write:delete'],
+        livemode: true
+      }
+    });
+
+    const notFoundMcpClient = new Client({ name: 'not-found-client', version: '1.0.0' });
+    const [cTransport, sTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      notFoundServer.server.connect(sTransport),
+      notFoundMcpClient.connect(cTransport)
+    ]);
+
+    const challenge = issueDnsDeletionChallenge('tenant_customerAcme', 'aeitron.com', 'rec_missing_record_404');
+
+    const result = await notFoundMcpClient.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_missing_record_404',
+        confirm: true,
+        approvalToken: challenge.token
+      }
+    });
+
+    assert.equal(result.isError, true);
+    const content = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(content.includes('RECORD_NOT_FOUND') || content.includes('not found'));
+
+    // State must be marked 'failed' (not execution_unknown) because upstream definitely rejected it
+    const stateReq = getDnsDeletionRequest(challenge.requestId);
+    assert.ok(stateReq);
+    assert.equal(stateReq.status, 'failed');
+
+    await notFoundMcpClient.close();
+    await notFoundServer.server.close();
+  });
+
+  it('17. delete_dns_record: strictly rejects anonymous tenant or missing actor', async () => {
+    const anonServer = createAeitronMcpServer({
+      authClaims: {
+        tenantId: 'anonymous',
+        actorId: 'anonymous_user',
+        tier: 'enterprise',
+        scopes: ['dns:write:delete'],
+        livemode: false
+      }
+    });
+
+    const anonClient = new Client({ name: 'anon-client', version: '1.0.0' });
+    const [cTransport, sTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      anonServer.server.connect(sTransport),
+      anonClient.connect(cTransport)
+    ]);
+
+    const result = await anonClient.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_anon_fail',
+        confirm: true
+      }
+    });
+
+    assert.equal(result.isError, true);
+    const content = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(content.includes('valid authenticated tenant and actor are required'));
+
+    await anonClient.close();
+    await anonServer.server.close();
+  });
+
+  it('18. delete_dns_record: strictly rejects malformed domain format', async () => {
+    const validServer = createAeitronMcpServer({
+      authClaims: {
+        tenantId: 'tenant_customerAcme',
+        actorId: 'usr_live_acme_admin',
+        tier: 'enterprise',
+        scopes: ['dns:write:delete'],
+        livemode: true
+      }
+    });
+
+    const validClient = new Client({ name: 'valid-client', version: '1.0.0' });
+    const [cTransport, sTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      validServer.server.connect(sTransport),
+      validClient.connect(cTransport)
+    ]);
+
+    const result = await validClient.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'invalid..domain--name',
+        recordId: 'rec_malformed_domain',
+        confirm: true
+      }
+    });
+
+    assert.equal(result.isError, true);
+    const content = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(content.includes('Invalid domain format'));
+
+    await validClient.close();
+    await validServer.server.close();
   });
 });
