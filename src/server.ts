@@ -7,11 +7,13 @@ import { AeitronApiClient } from './client.js';
 import { AuditLogger } from './audit.js';
 import { registerAllTools } from './tools/index.js';
 import { getConfig, McpServerConfig } from './config.js';
+import { AuthClaims } from './auth.js';
 
 export interface ServerOptions {
   config?: Partial<McpServerConfig>;
   client?: AeitronApiClient;
   audit?: AuditLogger;
+  authClaims?: AuthClaims;
 }
 
 export function createAeitronMcpServer(options: ServerOptions = {}): {
@@ -26,7 +28,7 @@ export function createAeitronMcpServer(options: ServerOptions = {}): {
   const server = new McpServer(
     {
       name: 'aeitron-mcp-server',
-      version: '0.1.0'
+      version: '1.0.0'
     },
     {
       capabilities: {
@@ -37,9 +39,8 @@ export function createAeitronMcpServer(options: ServerOptions = {}): {
     }
   );
 
-  // Register all tools onto the server
-  registerAllTools(server, client, audit);
+  // Register all tools onto the server with per-session auth claims
+  registerAllTools(server, client, audit, options.authClaims);
 
   return { server, client, audit };
 }
-

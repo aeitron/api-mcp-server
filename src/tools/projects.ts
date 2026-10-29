@@ -1,19 +1,21 @@
 /**
- * Aeitron MCP Tools — list_projects & get_project
- * Retrieves project inventory and deployment metadata
+ * Aeitron MCP Tools — list_projects, get_project, create_project
+ * Enforces per-tool scope validation and secure tenant context.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { AeitronApiClient } from '../client.js';
 import { AuditLogger } from '../audit.js';
+import { AuthClaims, checkToolAuthorization } from '../auth.js';
 
 export function registerProjectTools(
   server: McpServer,
   client: AeitronApiClient,
-  audit: AuditLogger
+  audit: AuditLogger,
+  authClaims?: AuthClaims
 ): void {
-  // 1. list_projects
+  // 1. list_projects (Scope: projects:read)
   server.tool(
     'list_projects',
     'List all projects accessible to the current tenant, including status, regions, primary domains, and total deployment counts.',
@@ -33,12 +35,27 @@ export function registerProjectTools(
         .describe('Zero-based offset index for pagination (default 0)')
     },
     async (args) => {
+      const authCheck = checkToolAuthorization('list_projects', authClaims);
+      if (!authCheck.authorized) {
+        audit.logToolExecution('list_projects', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, authCheck.error);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `403 Forbidden: ${authCheck.error}` }]
+        };
+      }
+
       const startTime = Date.now();
       try {
         const { projects, total } = await client.listProjects(args);
         const duration = Date.now() - startTime;
 
-        audit.logToolExecution('list_projects', args, duration, true);
+        audit.logToolExecution('list_projects', args, duration, true, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        });
 
         if (projects.length === 0) {
           return {
@@ -75,7 +92,10 @@ export function registerProjectTools(
         };
       } catch (err: unknown) {
         const duration = Date.now() - startTime;
-        audit.logToolExecution('list_projects', args, duration, false, undefined, err);
+        audit.logToolExecution('list_projects', args, duration, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, err);
 
         return {
           isError: true,
@@ -90,7 +110,7 @@ export function registerProjectTools(
     }
   );
 
-  // 2. get_project
+  // 2. get_project (Scope: projects:read)
   server.tool(
     'get_project',
     'Retrieve detailed status, environments, domain mappings, and performance metrics for a specific project.',
@@ -101,12 +121,27 @@ export function registerProjectTools(
         .describe('The unique project ID or slug (e.g. "prod-edge-gw" or "proj_gateway_edge_01")')
     },
     async (args) => {
+      const authCheck = checkToolAuthorization('get_project', authClaims);
+      if (!authCheck.authorized) {
+        audit.logToolExecution('get_project', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, authCheck.error);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `403 Forbidden: ${authCheck.error}` }]
+        };
+      }
+
       const startTime = Date.now();
       try {
         const project = await client.getProject(args.projectId);
         const duration = Date.now() - startTime;
 
-        audit.logToolExecution('get_project', args, duration, true);
+        audit.logToolExecution('get_project', args, duration, true, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        });
 
         const bandwidthGb = (project.metrics.bandwidthLast24hBytes / (1024 * 1024 * 1024)).toFixed(2);
         const domainsList = project.domains.map(d => `  - \`${d.hostname}\` (DNS: \`${d.status}\`, SSL: \`${d.sslStatus}\`)`).join('\n');
@@ -150,7 +185,10 @@ export function registerProjectTools(
         };
       } catch (err: unknown) {
         const duration = Date.now() - startTime;
-        audit.logToolExecution('get_project', args, duration, false, undefined, err);
+        audit.logToolExecution('get_project', args, duration, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, err);
 
         return {
           isError: true,
@@ -165,7 +203,7 @@ export function registerProjectTools(
     }
   );
 
-  // 3. create_project (Phase 2 Write Tool)
+  // 3. create_project (Scope: projects:write)
   server.tool(
     'create_project',
     'Provision a new infrastructure project workspace on the Aeitron edge network.',
@@ -185,12 +223,27 @@ export function registerProjectTools(
         .describe('Optional technology or framework preset (e.g. "rust-tokio", "node-hono", "static", "python")')
     },
     async (args) => {
+      const authCheck = checkToolAuthorization('create_project', authClaims);
+      if (!authCheck.authorized) {
+        audit.logToolExecution('create_project', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, authCheck.error);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `403 Forbidden: ${authCheck.error}` }]
+        };
+      }
+
       const startTime = Date.now();
       try {
         const project = await client.createProject(args);
         const duration = Date.now() - startTime;
 
-        audit.logToolExecution('create_project', args, duration, true);
+        audit.logToolExecution('create_project', args, duration, true, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        });
 
         const summaryText = [
           `### Project Created Successfully! 🎉`,
@@ -216,7 +269,10 @@ export function registerProjectTools(
         };
       } catch (err: unknown) {
         const duration = Date.now() - startTime;
-        audit.logToolExecution('create_project', args, duration, false, undefined, err);
+        audit.logToolExecution('create_project', args, duration, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, err);
 
         return {
           isError: true,
@@ -231,4 +287,3 @@ export function registerProjectTools(
     }
   );
 }
-

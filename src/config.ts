@@ -1,5 +1,7 @@
 /**
- * Aeitron MCP Server — Configuration & Environment Parser
+ * Aeitron MCP Server — Hardened Configuration & Environment Parser
+ * Enforces fail-closed production boundaries: zero mock fallback in production,
+ * required cryptographic secrets, and explicit CORS origin policies.
  */
 
 export interface McpServerConfig {
@@ -8,19 +10,49 @@ export interface McpServerConfig {
   environment: 'development' | 'staging' | 'production';
   mockFallback: boolean;
   requestTimeoutMs: number;
+  jwtSecret: string;
+  corsAllowedOrigins: string[];
+  allowSandbox: boolean;
 }
 
 export function getConfig(): McpServerConfig {
-  const env = process.env.AEITRON_ENV || 'development';
+  const env = (process.env.AEITRON_ENV || 'development').toLowerCase();
   const isProd = env === 'production';
+  const environment: 'development' | 'staging' | 'production' =
+    env === 'production' ? 'production' : env === 'staging' ? 'staging' : 'development';
+
+  // 1. Strict Fail-Closed Mock Fallback Guard
+  const explicitMock = process.env.AEITRON_MOCK_FALLBACK;
+  if (isProd && explicitMock === 'true') {
+    throw new Error('FATAL CONFIGURATION ERROR: AEITRON_MOCK_FALLBACK cannot be enabled in production.');
+  }
+  const mockFallback = isProd ? false : explicitMock === 'true';
+
+  // 2. Cryptographic JWT Secret
+  const jwtSecret = process.env.AEITRON_JWT_SECRET || (isProd ? '' : 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890');
+  if (isProd && (!jwtSecret || jwtSecret.length < 32)) {
+    throw new Error('FATAL CONFIGURATION ERROR: AEITRON_JWT_SECRET must be at least 32 characters in production.');
+  }
+
+  // 3. CORS Allowed Origins
+  const rawCors = process.env.AEITRON_CORS_ORIGINS;
+  const corsAllowedOrigins = rawCors
+    ? rawCors.split(',').map((s) => s.trim()).filter(Boolean)
+    : isProd
+    ? ['https://chatgpt.com', 'https://claude.ai', 'https://console.aeitron.com', 'https://api.aeitron.com']
+    : ['*'];
+
+  // 4. Sandbox Credentials Allowed
+  const allowSandbox = !isProd && process.env.AEITRON_ALLOW_SANDBOX !== 'false';
 
   return {
     apiBaseUrl: (process.env.AEITRON_API_BASE_URL || 'http://localhost:8080').replace(/\/+$/, ''),
     defaultApiKey: process.env.AEITRON_API_KEY || (isProd ? undefined : 'atk_sandbox_dev_default_key'),
-    environment: (env === 'production' || env === 'staging') ? env : 'development',
-    // In dev or tests, mock fallback allows graceful testing without requiring live upstream
-    mockFallback: process.env.AEITRON_MOCK_FALLBACK !== 'false',
-    requestTimeoutMs: parseInt(process.env.AEITRON_REQUEST_TIMEOUT_MS || '8000', 10)
+    environment,
+    mockFallback,
+    requestTimeoutMs: parseInt(process.env.AEITRON_REQUEST_TIMEOUT_MS || '8000', 10),
+    jwtSecret,
+    corsAllowedOrigins,
+    allowSandbox
   };
 }
-

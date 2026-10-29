@@ -53,7 +53,31 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     assert.ok(meta.scopes_supported.includes('dns:read'));
   });
 
-  it('4. Security Gate: rejects unauthenticated SSE connection with 401 Unauthorized', async () => {
+  it('4. GET /.well-known/jwks.json: returns compliant JWKS public key metadata', async () => {
+    const res = await fetch(`${baseUrl}/.well-known/jwks.json`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { keys: Array<{ kty: string; alg: string }> };
+    assert.ok(Array.isArray(body.keys));
+    assert.equal(body.keys[0].alg, 'HS256');
+  });
+
+  it('5. POST /v1/auth/token: performs client credentials token exchange', async () => {
+    const res = await fetch(`${baseUrl}/v1/auth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'client_credentials',
+        client_id: 'client_app_123'
+      })
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { access_token: string; token_type: string; expires_in: number };
+    assert.equal(body.token_type, 'Bearer');
+    assert.ok(typeof body.access_token === 'string' && body.access_token.startsWith('eyJ'));
+    assert.equal(body.expires_in, 3600);
+  });
+
+  it('6. Security Gate: rejects unauthenticated SSE connection with 401 Unauthorized', async () => {
     const res = await fetch(`${baseUrl}/mcp/sse`);
     assert.equal(res.status, 401);
     const problem = await res.json() as { type: string; status: number };
@@ -61,7 +85,7 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     assert.ok(problem.type.includes('unauthorized'));
   });
 
-  it('5. Remote MCP over SSE: connects client, discovers tools, and calls tool successfully', async () => {
+  it('7. Remote MCP over SSE: connects client, discovers tools, and calls tool successfully', async () => {
     // Authenticate via query param (standard browser EventSource pattern)
     const sseUrl = new URL(`${baseUrl}/mcp/sse?token=atk_sandbox_live_e2e_test`);
     const transport = new SSEClientTransport(sseUrl);
@@ -95,7 +119,7 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     await client.close();
   });
 
-  it('6. POST /mcp/messages: rejects unknown or expired session IDs with 404', async () => {
+  it('8. POST /mcp/messages: rejects unknown or expired session IDs with 404', async () => {
     const res = await fetch(`${baseUrl}/mcp/messages?sessionId=non_existent_session_id`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -107,4 +131,3 @@ describe('Remote Streamable HTTP (SSE) Transport Suite (Phase 2)', () => {
     assert.ok(body.error.includes('not found'));
   });
 });
-

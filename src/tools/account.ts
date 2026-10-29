@@ -6,17 +6,32 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { AeitronApiClient } from '../client.js';
 import { AuditLogger } from '../audit.js';
+import { AuthClaims, checkToolAuthorization } from '../auth.js';
 
 export function registerAccountTools(
   server: McpServer,
   client: AeitronApiClient,
-  audit: AuditLogger
+  audit: AuditLogger,
+  authClaims?: AuthClaims
 ): void {
   server.tool(
     'get_account',
     'Retrieve the authenticated Aeitron account information, active organization, current subscription tier, and global resource quotas.',
     {},
-    async (_args, extra) => {
+    async (_args) => {
+      // 1. Tool-level Authorization Gate
+      const authCheck = checkToolAuthorization('get_account', authClaims);
+      if (!authCheck.authorized) {
+        audit.logToolExecution('get_account', {}, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, authCheck.error);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `403 Forbidden: ${authCheck.error}` }]
+        };
+      }
+
       const startTime = Date.now();
       try {
         const account = await client.getAccount();
@@ -58,7 +73,10 @@ export function registerAccountTools(
         };
       } catch (err: unknown) {
         const duration = Date.now() - startTime;
-        audit.logToolExecution('get_account', {}, duration, false, undefined, err);
+        audit.logToolExecution('get_account', {}, duration, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, err);
 
         return {
           isError: true,
@@ -73,4 +91,3 @@ export function registerAccountTools(
     }
   );
 }
-

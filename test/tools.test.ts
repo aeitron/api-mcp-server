@@ -6,7 +6,7 @@ import { createAeitronMcpServer } from '../src/server.js';
 import { AuditLogger } from '../src/audit.js';
 import { AuditRecord } from '../src/types.js';
 
-describe('Aeitron MCP Tools Suite (Phase 1)', () => {
+describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
   let client: Client;
   let serverInstance: ReturnType<typeof createAeitronMcpServer>;
   const auditLogs: AuditRecord[] = [];
@@ -15,6 +15,21 @@ describe('Aeitron MCP Tools Suite (Phase 1)', () => {
     const audit = new AuditLogger((record) => auditLogs.push(record));
     serverInstance = createAeitronMcpServer({
       audit,
+      authClaims: {
+        tenantId: 'tenant_customerAcme',
+        actorId: 'usr_live_acme_admin',
+        tier: 'enterprise',
+        scopes: [
+          'account:read',
+          'projects:read',
+          'projects:write',
+          'dns:read',
+          'dns:write',
+          'dns:write:delete',
+          'usage:read'
+        ],
+        livemode: true
+      },
       config: {
         mockFallback: true,
         apiBaseUrl: 'http://127.0.0.1:9099'
@@ -114,7 +129,6 @@ describe('Aeitron MCP Tools Suite (Phase 1)', () => {
     assert.ok(markdown.includes('api.aeitron.com'));
     assert.ok(markdown.includes('24h Telemetry & Performance'));
 
-    // Verify env variables contain keys only, no raw secret values
     assert.ok(json.environmentVariables.includes('DATABASE_POOL_SIZE'));
     assert.ok(json.environmentVariables.includes('REDIS_CLUSTER_URL'));
     assert.ok(json.metrics.uptimePercentage > 99);
@@ -144,7 +158,6 @@ describe('Aeitron MCP Tools Suite (Phase 1)', () => {
       arguments: { domain: 'not-a-valid-domain' }
     });
 
-    // MCP SDK will return isError: true when schema validation fails
     assert.equal(result.isError, true);
   });
 
@@ -224,7 +237,23 @@ describe('Aeitron MCP Tools Suite (Phase 1)', () => {
     assert.ok(content[0].text.includes('SAFETY GUARD'));
   });
 
-  it('11. delete_dns_record: executes permanent deletion when confirm is true', async () => {
+  it('11. delete_dns_record Dry Run: returns safe impact preview without mutating DNS', async () => {
+    const result = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_003',
+        dryRun: true
+      }
+    });
+
+    assert.equal(result.isError, undefined);
+    const content = result.content as Array<{ text: string }>;
+    assert.ok(content[0].text.includes('DRY RUN PREVIEW'));
+    assert.ok(content[0].text.includes('rec_dns_cname_003'));
+  });
+
+  it('12. delete_dns_record: executes permanent deletion when confirm is true', async () => {
     const result = await client.callTool({
       name: 'delete_dns_record',
       arguments: {
@@ -239,5 +268,38 @@ describe('Aeitron MCP Tools Suite (Phase 1)', () => {
     assert.ok(content[0].text.includes('DNS Record Deleted Successfully'));
     const json = JSON.parse(content[1].text);
     assert.equal(json.success, true);
+  });
+
+  it('13. Scope Enforcement Gate: denies tools when caller lacks required permission scope', async () => {
+    const readOnlyServer = createAeitronMcpServer({
+      authClaims: {
+        tenantId: 'tenant_readonly',
+        actorId: 'usr_readonly',
+        tier: 'developer',
+        scopes: ['account:read', 'projects:read', 'dns:read'],
+        livemode: true
+      },
+      config: { mockFallback: true }
+    });
+
+    const limitedClient = new Client({ name: 'limited-client', version: '1.0.0' });
+    const [cTransport, sTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      readOnlyServer.server.connect(sTransport),
+      limitedClient.connect(cTransport)
+    ]);
+
+    const result = await limitedClient.callTool({
+      name: 'delete_dns_record',
+      arguments: { domain: 'aeitron.com', recordId: 'rec_01', confirm: true }
+    });
+
+    assert.equal(result.isError, true);
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes('403 Forbidden'));
+    assert.ok(text.includes('dns:write:delete'));
+
+    await limitedClient.close();
+    await readOnlyServer.server.close();
   });
 });

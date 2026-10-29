@@ -1,17 +1,20 @@
 /**
  * Aeitron MCP Tool — get_usage
- * Retrieves usage metrics, bandwidth, compute hours, and estimated billing costs
+ * Retrieves usage metrics, bandwidth, compute hours, and estimated billing costs.
+ * Enforces scope usage:read.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { AeitronApiClient } from '../client.js';
 import { AuditLogger } from '../audit.js';
+import { AuthClaims, checkToolAuthorization } from '../auth.js';
 
 export function registerUsageTools(
   server: McpServer,
   client: AeitronApiClient,
-  audit: AuditLogger
+  audit: AuditLogger,
+  authClaims?: AuthClaims
 ): void {
   server.tool(
     'get_usage',
@@ -23,12 +26,27 @@ export function registerUsageTools(
         .describe('Billing cycle to query: "current" (active month to date) or "previous" (last completed month)')
     },
     async (args) => {
+      const authCheck = checkToolAuthorization('get_usage', authClaims);
+      if (!authCheck.authorized) {
+        audit.logToolExecution('get_usage', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, authCheck.error);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `403 Forbidden: ${authCheck.error}` }]
+        };
+      }
+
       const startTime = Date.now();
       try {
         const usage = await client.getUsage(args.period);
         const duration = Date.now() - startTime;
 
-        audit.logToolExecution('get_usage', args, duration, true);
+        audit.logToolExecution('get_usage', args, duration, true, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        });
 
         const bandwidthGb = (usage.metrics.bandwidthBytes / (1024 * 1024 * 1024)).toFixed(2);
         const periodTitle = args.period === 'current' ? 'Current Month-to-Date' : 'Previous Billing Period';
@@ -65,7 +83,10 @@ export function registerUsageTools(
         };
       } catch (err: unknown) {
         const duration = Date.now() - startTime;
-        audit.logToolExecution('get_usage', args, duration, false, undefined, err);
+        audit.logToolExecution('get_usage', args, duration, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, err);
 
         return {
           isError: true,
@@ -80,4 +101,3 @@ export function registerUsageTools(
     }
   );
 }
-

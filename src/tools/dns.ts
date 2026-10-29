@@ -1,18 +1,21 @@
 /**
- * Aeitron MCP Tool — get_dns_records
- * Retrieves active DNS zone records for authorized domains
+ * Aeitron MCP Tool — DNS Zone Management (get_dns_records, create_dns_record, delete_dns_record)
+ * Enforces strict tool-level scope authorization and fail-closed safety confirmation with dry-run support.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { AeitronApiClient } from '../client.js';
 import { AuditLogger } from '../audit.js';
+import { AuthClaims, checkToolAuthorization } from '../auth.js';
 
 export function registerDnsTools(
   server: McpServer,
   client: AeitronApiClient,
-  audit: AuditLogger
+  audit: AuditLogger,
+  authClaims?: AuthClaims
 ): void {
+  // 1. get_dns_records (Scope: dns:read)
   server.tool(
     'get_dns_records',
     'Fetch active DNS records (A, AAAA, CNAME, TXT, MX) for an authorized domain on the Aeitron edge network.',
@@ -25,12 +28,27 @@ export function registerDnsTools(
         .describe('Fully qualified domain name (e.g. "example.com" or "api.aeitron.com")')
     },
     async (args) => {
+      const authCheck = checkToolAuthorization('get_dns_records', authClaims);
+      if (!authCheck.authorized) {
+        audit.logToolExecution('get_dns_records', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, authCheck.error);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `403 Forbidden: ${authCheck.error}` }]
+        };
+      }
+
       const startTime = Date.now();
       try {
         const { records } = await client.getDnsRecords(args.domain);
         const duration = Date.now() - startTime;
 
-        audit.logToolExecution('get_dns_records', args, duration, true);
+        audit.logToolExecution('get_dns_records', args, duration, true, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        });
 
         if (records.length === 0) {
           return {
@@ -68,7 +86,10 @@ export function registerDnsTools(
         };
       } catch (err: unknown) {
         const duration = Date.now() - startTime;
-        audit.logToolExecution('get_dns_records', args, duration, false, undefined, err);
+        audit.logToolExecution('get_dns_records', args, duration, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, err);
 
         return {
           isError: true,
@@ -83,7 +104,7 @@ export function registerDnsTools(
     }
   );
 
-  // 2. create_dns_record (Phase 2 Write Tool)
+  // 2. create_dns_record (Scope: dns:write)
   server.tool(
     'create_dns_record',
     'Add a new DNS routing record (A, AAAA, CNAME, TXT, MX) to an authorized domain zone.',
@@ -119,12 +140,27 @@ export function registerDnsTools(
         .describe('Whether edge proxy, DDoS protection, and TLS caching are enabled')
     },
     async (args) => {
+      const authCheck = checkToolAuthorization('create_dns_record', authClaims);
+      if (!authCheck.authorized) {
+        audit.logToolExecution('create_dns_record', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, authCheck.error);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `403 Forbidden: ${authCheck.error}` }]
+        };
+      }
+
       const startTime = Date.now();
       try {
         const record = await client.createDnsRecord(args);
         const duration = Date.now() - startTime;
 
-        audit.logToolExecution('create_dns_record', args, duration, true);
+        audit.logToolExecution('create_dns_record', args, duration, true, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        });
 
         const summaryText = [
           `### DNS Record Created Successfully! 🌐`,
@@ -150,7 +186,10 @@ export function registerDnsTools(
         };
       } catch (err: unknown) {
         const duration = Date.now() - startTime;
-        audit.logToolExecution('create_dns_record', args, duration, false, undefined, err);
+        audit.logToolExecution('create_dns_record', args, duration, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, err);
 
         return {
           isError: true,
@@ -165,10 +204,10 @@ export function registerDnsTools(
     }
   );
 
-  // 3. delete_dns_record (Phase 2 High-Risk Write Tool with Confirmation Guard)
+  // 3. delete_dns_record (Scope: dns:write:delete - High-Risk Write with Safety Confirmation & Dry Run)
   server.tool(
     'delete_dns_record',
-    'Permanently delete a DNS record from the domain zone. Requires explicit confirmation.',
+    'Permanently delete a DNS record from the domain zone. Requires scope dns:write:delete and explicit confirmation.',
     {
       domain: z
         .string()
@@ -180,30 +219,76 @@ export function registerDnsTools(
         .describe('The unique record ID to delete (e.g. "rec_dns_cname_003")'),
       confirm: z
         .boolean()
-        .describe('Safety Confirmation: Must be explicitly true to confirm permanent deletion.')
+        .default(false)
+        .describe('Safety Confirmation: Must be explicitly true to confirm permanent deletion.'),
+      dryRun: z
+        .boolean()
+        .default(false)
+        .describe('Dry Run: If true, returns an impact preview without performing the actual deletion.')
     },
     async (args) => {
-      const startTime = Date.now();
-
-      // Guarded Safety Check: Fail closed if confirm is not explicitly true
-      if (args.confirm !== true) {
-        audit.logToolExecution('delete_dns_record', args, 0, false, undefined, 'Confirmation rejected');
+      // 1. Enforce high-risk delete scope
+      const authCheck = checkToolAuthorization('delete_dns_record', authClaims);
+      if (!authCheck.authorized) {
+        audit.logToolExecution('delete_dns_record', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, authCheck.error);
         return {
           isError: true,
+          content: [{ type: 'text', text: `403 Forbidden: ${authCheck.error}` }]
+        };
+      }
+
+      // 2. Handle Dry Run Preview
+      if (args.dryRun === true) {
+        audit.logToolExecution('delete_dns_record_preview', args, 0, true, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        });
+        return {
           content: [
             {
               type: 'text',
-              text: `⚠️ SAFETY GUARD: Deleting a DNS record is a destructive action that can disrupt live production traffic. To proceed, please ask the user for confirmation and invoke this tool with confirm: true.`
+              text: [
+                `### ⚠️ DRY RUN PREVIEW: DNS Record Deletion`,
+                `- **Domain Zone:** \`${args.domain}\``,
+                `- **Target Record ID:** \`${args.recordId}\``,
+                `- **Impact:** Deleting this record will stop resolving DNS traffic for this name immediately.`,
+                `- **Action Required:** To execute the permanent deletion, invoke \`delete_dns_record\` with \`confirm: true\` and \`dryRun: false\`.`
+              ].join('\n')
             }
           ]
         };
       }
 
+      // 3. Guarded Safety Check: Fail closed if confirm is not explicitly true
+      if (args.confirm !== true) {
+        audit.logToolExecution('delete_dns_record', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, 'Confirmation rejected: confirm must be explicitly true');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `⚠️ SAFETY GUARD: Deleting a DNS record is a destructive action that can disrupt live production traffic. To proceed, please ask the user for confirmation and invoke this tool with confirm: true and dryRun: false.`
+            }
+          ]
+        };
+      }
+
+      // 4. Perform Permanent Deletion
+      const startTime = Date.now();
       try {
         const result = await client.deleteDnsRecord(args);
         const duration = Date.now() - startTime;
 
-        audit.logToolExecution('delete_dns_record', args, duration, true);
+        audit.logToolExecution('delete_dns_record', args, duration, true, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        });
 
         return {
           content: [
@@ -219,7 +304,10 @@ export function registerDnsTools(
         };
       } catch (err: unknown) {
         const duration = Date.now() - startTime;
-        audit.logToolExecution('delete_dns_record', args, duration, false, undefined, err);
+        audit.logToolExecution('delete_dns_record', args, duration, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, err);
 
         return {
           isError: true,
@@ -234,4 +322,3 @@ export function registerDnsTools(
     }
   );
 }
-

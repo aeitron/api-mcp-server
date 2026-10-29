@@ -1,6 +1,7 @@
 /**
- * Aeitron MCP Server — Remote Streamable HTTP (SSE) Server
- * Exposes SSE and JSON-RPC message endpoints for Claude, ChatGPT, and remote AI agents.
+ * Aeitron MCP Server — Hardened Remote Streamable HTTP (SSE) Server
+ * Enforces per-session cryptographic authentication, tool-level RBAC scopes,
+ * CORS origin allowlists, and RFC 8414 / RFC 7517 discovery metadata.
  */
 
 import http, { IncomingMessage, ServerResponse } from 'node:http';
@@ -9,7 +10,13 @@ import { cors } from 'hono/cors';
 import { getRequestListener } from '@hono/node-server';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { createAeitronMcpServer } from './server.js';
-import { extractTokenFromRequest, verifyAuthToken, getOAuthDiscoveryMetadata } from './auth.js';
+import {
+  extractTokenFromRequest,
+  verifyAuthToken,
+  getOAuthDiscoveryMetadata,
+  getJwksMetadata,
+  createSignedTestJwt
+} from './auth.js';
 import { getConfig, McpServerConfig } from './config.js';
 import { ToolContext } from './types.js';
 import { AeitronApiClient } from './client.js';
@@ -38,24 +45,31 @@ export function createMcpHttpServer(
   const activeSessions = new Map<string, ActiveSession>();
   const startTime = Date.now();
 
-  // 1. CORS Policy
+  // 1. Strict CORS Policy
   app.use('*', cors({
-    origin: '*',
+    origin: (origin) => {
+      if (!origin) return config.corsAllowedOrigins[0] || '*';
+      if (config.corsAllowedOrigins.includes('*') || config.corsAllowedOrigins.includes(origin)) {
+        return origin;
+      }
+      return null;
+    },
     allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'X-Tenant-ID'],
     exposeHeaders: ['X-Request-ID', 'X-Session-ID'],
     maxAge: 86400
   }));
 
-  // 2. Health & Readiness
+  // 2. Health & Readiness Probes
   app.get('/health', (c) => {
     return c.json({
       status: 'ok',
       service: 'aeitron-mcp-server',
-      version: '0.1.0',
+      version: '1.0.0',
       environment: config.environment,
       uptimeSeconds: Math.floor((Date.now() - startTime) / 1000),
-      activeSessions: activeSessions.size
+      activeSessions: activeSessions.size,
+      mockFallbackEnabled: config.mockFallback
     });
   });
 
@@ -64,28 +78,65 @@ export function createMcpHttpServer(
       ready: true,
       service: 'aeitron-mcp-server',
       supportedTransports: ['stdio', 'sse'],
-      toolsAvailable: ['get_account', 'list_projects', 'get_project', 'get_dns_records', 'get_usage']
+      toolsAvailable: [
+        'get_account',
+        'list_projects',
+        'get_project',
+        'get_dns_records',
+        'get_usage',
+        'create_project',
+        'create_dns_record',
+        'delete_dns_record'
+      ]
     });
   });
 
-  // 3. OAuth 2.0 Authorization Server Metadata (RFC 8414)
+  // 3. RFC 8414 OAuth 2.0 Authorization Server Discovery
   const oauthHandler = (c: { json: (data: unknown) => Response }) => {
     return c.json(getOAuthDiscoveryMetadata(config.apiBaseUrl));
   };
   app.get('/.well-known/oauth-authorization-server', oauthHandler);
   app.get('/mcp/.well-known/oauth-authorization-server', oauthHandler);
 
-  // 4. Welcome & Discovery
+  // 4. RFC 7517 JSON Web Key Set (JWKS) Discovery
+  const jwksHandler = (c: { json: (data: unknown) => Response }) => {
+    return c.json(getJwksMetadata());
+  };
+  app.get('/.well-known/jwks.json', jwksHandler);
+  app.get('/mcp/.well-known/jwks.json', jwksHandler);
+
+  // 5. Mock / Local Token Exchange Endpoint for OAuth Testing
+  app.post('/v1/auth/token', async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    if (body.grant_type === 'client_credentials') {
+      const token = createSignedTestJwt({
+        sub: body.client_id || 'usr_client_cred',
+        tenant_id: 'tenant_client_workspace',
+        scopes: ['account:read', 'projects:read', 'dns:read', 'usage:read']
+      });
+      return c.json({
+        access_token: token,
+        token_type: 'Bearer',
+        expires_in: 3600,
+        scope: 'account:read projects:read dns:read usage:read'
+      });
+    }
+    return c.json({ error: 'unsupported_grant_type' }, 400);
+  });
+
+  // 6. Welcome & Discovery
   app.get('/', (c) => {
     return c.json({
       name: 'Aeitron Infrastructure MCP Server',
       description: 'Official Model Context Protocol server connecting AI clients with Aeitron Cloud & Edge Infrastructure',
+      version: '1.0.0',
       endpoints: {
         sse: '/mcp/sse',
         messages: '/mcp/messages?sessionId={id}',
         health: '/health',
         ready: '/ready',
-        oauthMetadata: '/.well-known/oauth-authorization-server'
+        oauthMetadata: '/.well-known/oauth-authorization-server',
+        jwks: '/.well-known/jwks.json'
       },
       documentation: 'https://docs.aeitron.com/mcp'
     });
@@ -93,7 +144,7 @@ export function createMcpHttpServer(
 
   const honoListener = getRequestListener(app.fetch);
 
-  // 5. Main Node HTTP Dispatcher
+  // 7. Main Node HTTP Dispatcher
   const httpServer = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const host = req.headers.host || 'localhost';
     const parsedUrl = new URL(req.url || '/', `http://${host}`);
@@ -108,8 +159,16 @@ export function createMcpHttpServer(
       }
 
       // Authenticate SSE connection
-      const rawToken = extractTokenFromRequest(req, parsedUrl);
-      const auth = verifyAuthToken(rawToken, { isProduction: config.environment === 'production' });
+      const { token: rawToken, wasInQuery } = extractTokenFromRequest(req, parsedUrl);
+      if (wasInQuery && config.environment === 'production') {
+        process.stderr.write('[aeitron-mcp][WARN] Token provided via query parameter in production. Authorization: Bearer <token> header is strongly recommended.\n');
+      }
+
+      const auth = verifyAuthToken(rawToken, {
+        isProduction: config.environment === 'production',
+        allowSandbox: config.allowSandbox,
+        jwtSecret: config.jwtSecret
+      });
 
       if (!auth.success) {
         res.writeHead(auth.status, {
@@ -131,7 +190,7 @@ export function createMcpHttpServer(
         actorId: auth.claims.actorId
       };
 
-      // Create dedicated client & server instance bound to this tenant context
+      // Create dedicated client & server instance bound to this verified tenant and scopes
       const apiClient = new AeitronApiClient({
         ...config,
         defaultApiKey: auth.token
@@ -139,7 +198,8 @@ export function createMcpHttpServer(
 
       const serverInstance = createAeitronMcpServer({
         config,
-        client: apiClient
+        client: apiClient,
+        authClaims: auth.claims
       });
 
       // Target endpoint client should POST messages to
@@ -243,12 +303,13 @@ export function createMcpHttpServer(
 // Standalone execution if started directly: node dist/http.js
 if (process.argv[1] && process.argv[1].endsWith('http.js')) {
   const port = parseInt(process.env.PORT || '3005', 10);
-  const { httpServer, activeSessions } = createMcpHttpServer();
+  const { httpServer } = createMcpHttpServer();
 
   httpServer.listen(port, () => {
     process.stderr.write(`[aeitron-mcp] Remote Streamable HTTP (SSE) Server listening on http://localhost:${port}\n`);
     process.stderr.write(`[aeitron-mcp] Handshake endpoint: http://localhost:${port}/mcp/sse\n`);
     process.stderr.write(`[aeitron-mcp] Health endpoint:    http://localhost:${port}/health\n`);
+    process.stderr.write(`[aeitron-mcp] JWKS endpoint:      http://localhost:${port}/.well-known/jwks.json\n`);
   });
 
   const shutdown = async () => {
@@ -261,4 +322,3 @@ if (process.argv[1] && process.argv[1].endsWith('http.js')) {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
-
