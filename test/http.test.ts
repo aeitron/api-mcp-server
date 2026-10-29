@@ -338,11 +338,14 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     const req = createDnsDeletionRequest('tenant_customerAcme', 'usr_agent_01', 'aeitron.com', 'rec_cname_999');
     assert.ok(req.requestId.startsWith('del_req_'));
 
-    // Operator with insufficient scopes attempts approval -> 403 Forbidden
+    // 1. Operator with insufficient scopes attempts approval -> 403 Forbidden
     const unprivilegedToken = createSignedTestJwt({
       sub: 'usr_readonly_op',
       tenant_id: 'tenant_customerAcme',
-      scopes: ['account:read', 'dns:read'] // missing dns:write:delete
+      scopes: ['account:read', 'dns:read'],
+      actor_type: 'human',
+      auth_methods: ['mfa'],
+      auth_time: Math.floor(Date.now() / 1000)
     });
 
     const unprivRes = await fetch(`${baseUrl}/v1/dns/approve-deletion`, {
@@ -355,11 +358,78 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     });
     assert.equal(unprivRes.status, 403);
 
-    // Operator with valid dns:delete:approve scope approves deletion request -> 200 OK with approvalToken
+    // 2. Machine/Service token with dns:delete:approve scope -> 403 human_verification_required
+    const serviceToken = createSignedTestJwt({
+      sub: 'svc_backend_worker',
+      tenant_id: 'tenant_customerAcme',
+      scopes: ['dns:delete:approve'],
+      actor_type: 'service'
+    });
+
+    const svcRes = await fetch(`${baseUrl}/v1/dns/approve-deletion`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${serviceToken}`
+      },
+      body: JSON.stringify({ requestId: req.requestId })
+    });
+    assert.equal(svcRes.status, 403);
+    const svcBody = await svcRes.json() as { error: string };
+    assert.equal(svcBody.error, 'human_verification_required');
+
+    // 3. Human token missing MFA -> 403 human_verification_required
+    const noMfaToken = createSignedTestJwt({
+      sub: 'usr_human_no_mfa',
+      tenant_id: 'tenant_customerAcme',
+      scopes: ['dns:delete:approve'],
+      actor_type: 'human',
+      auth_methods: ['pwd'],
+      auth_time: Math.floor(Date.now() / 1000)
+    });
+
+    const noMfaRes = await fetch(`${baseUrl}/v1/dns/approve-deletion`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${noMfaToken}`
+      },
+      body: JSON.stringify({ requestId: req.requestId })
+    });
+    assert.equal(noMfaRes.status, 403);
+    const noMfaBody = await noMfaRes.json() as { error: string };
+    assert.equal(noMfaBody.error, 'human_verification_required');
+
+    // 4. Human token with stale MFA (> 300 seconds ago) -> 403 human_verification_required
+    const staleMfaToken = createSignedTestJwt({
+      sub: 'usr_human_stale_mfa',
+      tenant_id: 'tenant_customerAcme',
+      scopes: ['dns:delete:approve'],
+      actor_type: 'human',
+      auth_methods: ['mfa'],
+      auth_time: Math.floor(Date.now() / 1000) - 360 // 6 minutes old
+    });
+
+    const staleRes = await fetch(`${baseUrl}/v1/dns/approve-deletion`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${staleMfaToken}`
+      },
+      body: JSON.stringify({ requestId: req.requestId })
+    });
+    assert.equal(staleRes.status, 403);
+    const staleBody = await staleRes.json() as { error: string };
+    assert.equal(staleBody.error, 'human_verification_required');
+
+    // 5. Verified human operator with valid dns:delete:approve scope and recent MFA -> 200 OK with approvalToken
     const operatorToken = createSignedTestJwt({
       sub: 'usr_authorized_operator',
       tenant_id: 'tenant_customerAcme',
-      scopes: ['dns:delete:approve']
+      scopes: ['dns:delete:approve'],
+      actor_type: 'human',
+      auth_methods: ['pwd', 'mfa'],
+      auth_time: Math.floor(Date.now() / 1000)
     });
 
     const approveRes = await fetch(`${baseUrl}/v1/dns/approve-deletion`, {
@@ -886,5 +956,25 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
       }
     }
     assert.equal(hitRateLimit, true, 'Rate limiter must return 429 when capacity is exceeded');
+  });
+
+  it('32. Socket IP Rate Limiter: prevents bypass via spoofed X-Forwarded-For headers', async () => {
+    // Attempt to bypass token rate limiter by rotating fake X-Forwarded-For IPs
+    let hitRateLimit = false;
+    for (let i = 0; i < 110; i++) {
+      const res = await fetch(`${baseUrl}/v1/auth/token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': `203.0.113.${i}` // Rotating spoofed client IPs
+        },
+        body: JSON.stringify({ grant_type: 'client_credentials' })
+      });
+      if (res.status === 429) {
+        hitRateLimit = true;
+        break;
+      }
+    }
+    assert.equal(hitRateLimit, true, 'Rate limiter must key off authentic socket IP and block spoofed headers');
   });
 });

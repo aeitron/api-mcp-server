@@ -31,7 +31,9 @@ The MCP server exposes strictly-typed, schema-validated tools governed by server
 - **Zero Hardcoded Credentials:** Zero live API keys in source code. Production credentials are dynamically loaded from `AEITRON_API_KEYS` and verified via SHA-256 hashes.
 - **Fail-Closed Mandatory JWT Claims:** All JWTs must include valid numeric `exp` (expiration), trusted `iss` (`https://api.aeitron.com`), verified `aud` (`aeitron-mcp`), and explicit `scopes`. Missing claims or signatures reject with 401 Unauthorized.
 - **Authenticated OAuth Token Exchange:** `POST /v1/auth/token` enforces real client authentication (client ID and client secret verification) before issuing scoped Bearer tokens.
-- **Two-Step Destructive Action Challenge:** Deleting DNS records cannot be self-authorized by an LLM prompt. The server issues a short-lived cryptographic approval token (`del_tok_...`) that must be confirmed by the human operator.
+- **Two-Step Destructive Action Challenge & Human MFA Verification:** Deleting DNS records cannot be self-authorized by an LLM prompt or machine service token. Destructive mutations require explicit human operator authorization (`dns:delete:approve` scope, `actor_type: 'human'`, and recent MFA within 5 minutes) via console or CLI (`aeitron dns approve-deletion`), issuing a short-lived, replay-protected cryptographic approval token (`del_tok_...`).
+- **Authentic Socket-Level Rate Limiting:** Sensitive endpoints (`/v1/auth/token`, `/v1/dns/approve-deletion`, and DNS deletions) enforce rate limits bound to the underlying TCP socket remote address and tenant identity, blocking spoofed `X-Forwarded-For` bypasses and auto-pruning idle buckets.
+- **Durable In-Flight Recovery & Expired Hash Pruning:** In-flight operations in `executing` and `execution_unknown` states remain durably retained across server restarts regardless of approval TTL, while consumed token hashes are automatically pruned once their retention window expires.
 - **Modern Streamable HTTP & Legacy SSE:** Implements modern MCP Streamable HTTP (`POST /mcp`) alongside backward-compatible Server-Sent Events (`GET /mcp/sse`), complete with OPTIONS preflight handling and strict CORS origin allowlists.
 - **Fail-Closed Tool Authorization:** Any unmapped tool or caller lacking explicit RBAC scopes is denied with 403 Forbidden.
 - **Zero Direct Database Access:** Dispatches all operations through authorized upstream APIs.
@@ -106,6 +108,6 @@ npm install
 # Compile TypeScript
 npm run build
 
-# Run complete verification test suite (115 tests across 6 test suites)
+# Run complete verification test suite (120 tests across 6 test suites)
 npm test
 ```

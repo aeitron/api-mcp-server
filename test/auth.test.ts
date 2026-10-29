@@ -2,6 +2,8 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { IncomingMessage } from 'node:http';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   extractTokenFromRequest,
   verifyAuthToken,
@@ -902,5 +904,107 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     assert.equal(typeof isRsaReady(), 'boolean');
     assert.equal(isStorageReady(), true);
     assert.equal(isRsaReady(), true);
+  });
+
+  it('getDnsDeletionRequest retains unresolved in-flight executing requests across state reloads even after expiresAt has passed', () => {
+    const req = createDnsDeletionRequest('tenant_inflight_test', 'usr_client_2', 'example.com', 'rec_inflight_1');
+    assert.ok(req.requestId);
+
+    const authRes = authorizeDnsDeletionRequest(
+      {
+        actorId: 'usr_operator_inflight',
+        tenantId: 'tenant_inflight_test',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'human',
+        authMethods: ['mfa'],
+        authTime: Math.floor(Date.now() / 1000)
+      },
+      req.requestId
+    );
+    assert.equal(authRes.success, true);
+    if (!authRes.success) return;
+
+    // Move to executing state
+    const consumeRes = verifyDnsDeletionChallenge(authRes.token, 'tenant_inflight_test', 'example.com', 'rec_inflight_1');
+    assert.equal(consumeRes.valid, true);
+
+    // Read and simulate past expiresAt (as if approval window expired during long-running operation)
+    const inFlightReq = getDnsDeletionRequest(req.requestId)!;
+    assert.equal(inFlightReq.status, 'executing');
+
+    // Manually write state with past expiresAt (createdAt < expiresAt < now) to test recovery logic on disk load
+    const stateFile = path.join(process.cwd(), '.aeitron-state', 'dns-deletion-state.json');
+    const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+    const targetItem = state.requests.find((r: any) => r.requestId === req.requestId);
+    targetItem.createdAt = Date.now() - 600000; // Created 10 minutes ago
+    targetItem.expiresAt = Date.now() - 60000;  // Expired 1 minute ago
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+
+    // Reload state - must retain unresolved in-flight executing request
+    const reloaded = getDnsDeletionRequest(req.requestId);
+    assert.ok(reloaded, 'Executing request must be retained for recovery even if expiresAt has passed');
+    assert.equal(reloaded.status, 'executing');
+  });
+
+  it('authorizeDnsDeletionRequest strictly rejects service / machine account tokens', () => {
+    const req = createDnsDeletionRequest('tenant_svc_guard', 'usr_client_3', 'example.com', 'rec_svc_guard_1');
+    const authRes = authorizeDnsDeletionRequest(
+      {
+        actorId: 'svc_background_bot',
+        tenantId: 'tenant_svc_guard',
+        tier: 'enterprise',
+        scopes: ['dns:delete:approve'],
+        livemode: false,
+        actorType: 'service'
+      },
+      req.requestId
+    );
+    assert.equal(authRes.success, false);
+    assert.equal(authRes.status, 403);
+    assert.ok(authRes.error.includes('Service accounts and non-human actors cannot authorize DNS deletions'));
+  });
+
+  it('checkDnsDeletionRateLimit bounds requests per tenant and clearTestRegistries resets limits', async () => {
+    const { checkDnsDeletionRateLimit, clearTestRegistries } = await import('../src/auth.js');
+    clearTestRegistries();
+
+    const tenant = 'tenant_burst_test';
+    // Consume limit of 30
+    for (let i = 0; i < 30; i++) {
+      assert.equal(checkDnsDeletionRateLimit(tenant), true);
+    }
+    // 31st request is throttled
+    assert.equal(checkDnsDeletionRateLimit(tenant), false);
+
+    // Reset clears buckets
+    clearTestRegistries();
+    assert.equal(checkDnsDeletionRateLimit(tenant), true);
+  });
+
+  it('consumedTokens TTL pruning: automatically prunes hashes where retainUntil <= now', () => {
+    const stateFile = path.join(process.cwd(), '.aeitron-state', 'dns-deletion-state.json');
+    const expiredHash = crypto.createHash('sha256').update('expired-token-1').digest('hex');
+    const validHash = crypto.createHash('sha256').update('valid-token-2').digest('hex');
+
+    const state = {
+      version: 1,
+      requests: [],
+      consumedTokens: [
+        { hash: expiredHash, retainUntil: Date.now() - 5000 },
+        { hash: validHash, retainUntil: Date.now() + 60000 }
+      ],
+      consumedTokenHashes: [expiredHash, validHash]
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+
+    // Create a new request to trigger state load and save
+    createDnsDeletionRequest('tenant_prune_test', 'usr_prune', 'aeitron.com', 'rec_prune_1');
+
+    const reloaded = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+    const tokenHashes = reloaded.consumedTokens.map((t: any) => t.hash);
+    assert.equal(tokenHashes.includes(validHash), true, 'Valid token must be retained');
+    assert.equal(tokenHashes.includes(expiredHash), false, 'Expired token hash must be pruned');
   });
 });

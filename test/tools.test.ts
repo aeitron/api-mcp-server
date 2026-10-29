@@ -295,7 +295,7 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
 
     assert.equal(replayResult.isError, true);
     const replayContent = replayResult.content as Array<{ text: string }>;
-    assert.ok(replayContent[0].text.includes('replay attempt detected'));
+    assert.ok(replayContent[0].text.includes('replay attempt detected'), `Expected replay attempt detected, got: ${replayContent[0]?.text}`);
   });
 
   it('12b. End-to-End Human Operator Approval: dry run produces request ID, operator authorizes, deletion succeeds', async () => {
@@ -381,7 +381,10 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     const operatorToken = createSignedTestJwt({
       sub: 'usr_operator_cli_admin',
       tenant_id: 'tenant_customerAcme',
-      scopes: ['dns:delete:approve']
+      scopes: ['dns:delete:approve'],
+      actor_type: 'human',
+      auth_methods: ['pwd', 'mfa'],
+      auth_time: Math.floor(Date.now() / 1000)
     });
 
     const cliResult = await handleDnsApproveDeletion({

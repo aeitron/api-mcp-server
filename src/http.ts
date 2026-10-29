@@ -80,12 +80,33 @@ export function createMcpHttpServer(
     pendingSessionCreations = Math.max(0, pendingSessionCreations - 1);
   }
 
-  // In-memory token bucket rate limiter for sensitive endpoints
+  // In-memory token bucket rate limiter for sensitive endpoints with bounded capacity and idle eviction
+  const MAX_RATE_LIMIT_BUCKETS = 10000;
   const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+
+  function sweepRateLimitBuckets(now = Date.now()): void {
+    for (const [key, bucket] of rateLimitBuckets.entries()) {
+      if (now - bucket.lastRefill > 3600000) {
+        rateLimitBuckets.delete(key);
+      }
+    }
+    if (rateLimitBuckets.size > MAX_RATE_LIMIT_BUCKETS) {
+      const entries = Array.from(rateLimitBuckets.entries())
+        .sort((a, b) => a[1].lastRefill - b[1].lastRefill);
+      const toRemove = entries.slice(0, entries.length - MAX_RATE_LIMIT_BUCKETS);
+      for (const [k] of toRemove) {
+        rateLimitBuckets.delete(k);
+      }
+    }
+  }
+
   function checkRateLimit(key: string, capacity = 60, refillPerSec = 1): boolean {
     const now = Date.now();
     let bucket = rateLimitBuckets.get(key);
     if (!bucket) {
+      if (rateLimitBuckets.size >= MAX_RATE_LIMIT_BUCKETS) {
+        sweepRateLimitBuckets(now);
+      }
       bucket = { tokens: capacity - 1, lastRefill: now };
       rateLimitBuckets.set(key, bucket);
       return true;
@@ -208,7 +229,7 @@ export function createMcpHttpServer(
   // 5. Authenticated OAuth 2.0 Token Exchange Endpoint
   // Enforces client authentication (Basic Auth or JSON body) — zero unauthenticated tokens!
   app.post('/v1/auth/token', async (c) => {
-    const clientIp = c.req.header('x-forwarded-for')?.split(',')[0].trim() || 'local';
+    const clientIp = (c.req.header('x-aeitron-socket-ip') || '127.0.0.1').trim();
     if (!checkRateLimit(`auth_token:${clientIp}`, 100, 5)) {
       return c.json({
         error: 'slow_down',
@@ -296,6 +317,22 @@ export function createMcpHttpServer(
         error: 'unauthorized',
         error_description: auth.error
       }, auth.status);
+    }
+
+    // P1 Guard: DNS deletion approval requires a verified human operator with recent MFA
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const isHuman = auth.claims.actorType === 'human';
+    const hasMfa = auth.claims.authMethods?.includes('mfa') === true;
+    const isRecentAuth =
+      typeof auth.claims.authTime === 'number' &&
+      nowSeconds >= auth.claims.authTime &&
+      nowSeconds - auth.claims.authTime <= 300;
+
+    if (!isHuman || !hasMfa || !isRecentAuth) {
+      return c.json({
+        error: 'human_verification_required',
+        error_description: 'DNS deletion approval requires an authenticated human operator with recent MFA verification (within 5 minutes).'
+      }, 403);
     }
 
     if (!checkRateLimit(`dns_approve:${auth.claims.tenantId}`, 60, 2)) {
@@ -506,6 +543,8 @@ export function createMcpHttpServer(
 
   // 7. Main Node HTTP Dispatcher with Centralized CORS Preflight & Transport Routing
   const httpServer = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const socketIp = req.socket?.remoteAddress || '127.0.0.1';
+    req.headers['x-aeitron-socket-ip'] = socketIp;
     const host = req.headers.host || 'localhost';
     const parsedUrl = new URL(req.url || '/', `http://${host}`);
     const pathname = parsedUrl.pathname;
@@ -1004,6 +1043,7 @@ export function createMcpHttpServer(
   const sweepIntervalMs = Math.min(config.sessionIdleTimeoutMs, 30000);
   const idleCleanupInterval = setInterval(() => {
     const now = Date.now();
+    sweepRateLimitBuckets(now);
     for (const [id, session] of streamableSessions.entries()) {
       if (now - session.lastActiveAt > config.sessionIdleTimeoutMs) {
         streamableSessions.delete(id);

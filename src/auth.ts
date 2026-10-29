@@ -17,6 +17,9 @@ export interface AuthClaims {
   scopes: string[];
   livemode: boolean;
   expiresAt?: number;
+  actorType?: 'human' | 'service';
+  authMethods?: string[];
+  authTime?: number;
 }
 
 export interface AuthSuccess {
@@ -198,6 +201,104 @@ export function verifyRsaKeyPairMatch(privateKeyPem: string, publicKeyPem: strin
   }
 }
 
+// Synchronous sleep helper for atomic lock backoff
+function sleepSync(ms: number): void {
+  try {
+    const sab = new SharedArrayBuffer(4);
+    const int32 = new Int32Array(sab);
+    Atomics.wait(int32, 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {}
+  }
+}
+
+/**
+ * Cross-process atomic lock using exclusive lockfile flag 'wx'.
+ * Tracks ownerToken to eliminate release races and validates process liveness.
+ */
+function acquireDnsStateLock(): () => void {
+  const dir = ensureStorageDir();
+  const lockPath = path.join(dir, 'dns-deletion-state.lock');
+  const maxWaitMs = 5000;
+  const start = Date.now();
+  const ownerToken = crypto.randomUUID();
+  let acquired = false;
+
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeFileSync(fd, JSON.stringify({ ownerToken, pid: process.pid, createdAt: Date.now() }));
+      fs.closeSync(fd);
+      acquired = true;
+      break;
+    } catch (err: unknown) {
+      const code = (err as { code?: string })?.code;
+      if (code === 'EEXIST' || code === 'EBUSY') {
+        try {
+          if (fs.existsSync(lockPath)) {
+            let isProcessDead = false;
+            try {
+              const content = fs.readFileSync(lockPath, 'utf-8');
+              const data = JSON.parse(content);
+              if (typeof data.pid !== 'number') {
+                isProcessDead = false;
+              } else {
+                try {
+                  process.kill(data.pid, 0);
+                  isProcessDead = false;
+                } catch (killErr: any) {
+                  isProcessDead = killErr?.code === 'ESRCH';
+                }
+              }
+            } catch {
+              // Lock file may be in process of being created/written (0-byte window)
+              // Fail closed: never unlink lock when read fails
+              isProcessDead = false;
+            }
+
+            // Strictly reclaim only when the holding process is confirmed dead.
+            // Do not delete active locks based solely on elapsed time.
+            if (isProcessDead) {
+              try {
+                fs.unlinkSync(lockPath);
+              } catch {}
+            }
+          }
+        } catch {}
+        sleepSync(20);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (!acquired) {
+    throw new Error('TIMEOUT: Failed to acquire DNS state lock within 5000ms.');
+  }
+
+  return () => {
+    try {
+      if (fs.existsSync(lockPath)) {
+        const content = fs.readFileSync(lockPath, 'utf-8');
+        const data = JSON.parse(content);
+        if (data.ownerToken === ownerToken) {
+          fs.unlinkSync(lockPath);
+        }
+      }
+    } catch {}
+  };
+}
+
+export function withDnsStateLock<T>(fn: () => T): T {
+  const release = acquireDnsStateLock();
+  try {
+    return fn();
+  } finally {
+    release();
+  }
+}
+
 // Asymmetric Key Pair for RFC 7517 compliant JWKS public key distribution and RS256 signing
 export function loadOrGenerateRsaKeyPair(): RsaKeyPair {
   // Guard: Configured RSA key file must exist in hardened environments
@@ -275,46 +376,50 @@ export function loadOrGenerateRsaKeyPair(): RsaKeyPair {
     }
   }
 
-  // 3. Persistent Local Storage Cache (preserves identical key pair across server restarts & multi-process CLI)
+  // 3. Persistent Local Storage Cache with Double-Checked Locking
+  // Eliminates race condition where concurrent worker starts generate conflicting key pairs
   const stateDir = ensureStorageDir();
   const cachedKeyFile = path.join(stateDir, 'aeitron-jwt-rsa.json');
-  try {
-    if (fs.existsSync(cachedKeyFile)) {
-      const cachedContent = fs.readFileSync(cachedKeyFile, 'utf-8');
-      const cached = JSON.parse(cachedContent);
-      if (cached.privateKey && cached.publicKey) {
-        if (verifyRsaKeyPairMatch(cached.privateKey, cached.publicKey)) {
-          return { privateKey: cached.privateKey, publicKey: cached.publicKey };
+
+  return withDnsStateLock(() => {
+    try {
+      if (fs.existsSync(cachedKeyFile)) {
+        const cachedContent = fs.readFileSync(cachedKeyFile, 'utf-8');
+        const cached = JSON.parse(cachedContent);
+        if (cached.privateKey && cached.publicKey) {
+          if (verifyRsaKeyPairMatch(cached.privateKey, cached.publicKey)) {
+            return { privateKey: cached.privateKey, publicKey: cached.publicKey };
+          }
         }
       }
+    } catch {
+      // Corrupt cache file, fall through
     }
-  } catch {
-    // Corrupt cache file, fall through
-  }
 
-  // 4. Generate new RSA-2048 key pair
-  const generated = crypto.generateKeyPairSync('rsa', {
-    modulusLength: 2048,
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    // 4. Generate new RSA-2048 key pair
+    const generated = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+
+    // Persist generated key pair to local storage cache atomically
+    try {
+      const tempFile = `${cachedKeyFile}.tmp.${process.pid}.${Date.now()}`;
+      fs.writeFileSync(
+        tempFile,
+        JSON.stringify({ privateKey: generated.privateKey, publicKey: generated.publicKey, generatedAt: Date.now() }, null, 2),
+        { encoding: 'utf-8', mode: 0o600 }
+      );
+      fs.renameSync(tempFile, cachedKeyFile);
+    } catch (err) {
+      if (isHardenedEnvironment()) {
+        throw new Error(`CRITICAL: Failed to persist generated RSA key pair to '${cachedKeyFile}' in hardened environment: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    return generated;
   });
-
-  // Persist generated key pair to local storage cache atomically
-  try {
-    const tempFile = `${cachedKeyFile}.tmp.${Date.now()}`;
-    fs.writeFileSync(
-      tempFile,
-      JSON.stringify({ privateKey: generated.privateKey, publicKey: generated.publicKey, generatedAt: Date.now() }, null, 2),
-      { encoding: 'utf-8', mode: 0o600 }
-    );
-    fs.renameSync(tempFile, cachedKeyFile);
-  } catch (err) {
-    if (isHardenedEnvironment()) {
-      throw new Error(`CRITICAL: Failed to persist generated RSA key pair to '${cachedKeyFile}' in hardened environment: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  return generated;
 }
 
 const RSA_KEY_PAIR = loadOrGenerateRsaKeyPair();
@@ -365,102 +470,6 @@ export function registerHistoricalRsaKeyForTesting(kid: string, publicKeyPem: st
   registerPublicKey(kid, publicKeyPem, false);
 }
 
-// Synchronous sleep helper for atomic lock backoff
-function sleepSync(ms: number): void {
-  try {
-    const sab = new SharedArrayBuffer(4);
-    const int32 = new Int32Array(sab);
-    Atomics.wait(int32, 0, 0, ms);
-  } catch {
-    const end = Date.now() + ms;
-    while (Date.now() < end) {}
-  }
-}
-
-/**
- * Cross-process atomic lock using exclusive lockfile flag 'wx'.
- * Tracks ownerToken to eliminate release races and validates process liveness.
- */
-function acquireDnsStateLock(): () => void {
-  const dir = ensureStorageDir();
-  const lockPath = path.join(dir, 'dns-deletion-state.lock');
-  const maxWaitMs = 5000;
-  const start = Date.now();
-  const ownerToken = crypto.randomUUID();
-  let acquired = false;
-
-  while (Date.now() - start < maxWaitMs) {
-    try {
-      const fd = fs.openSync(lockPath, 'wx');
-      fs.writeFileSync(fd, JSON.stringify({ ownerToken, pid: process.pid, createdAt: Date.now() }));
-      fs.closeSync(fd);
-      acquired = true;
-      break;
-    } catch (err: unknown) {
-      const code = (err as { code?: string })?.code;
-      if (code === 'EEXIST' || code === 'EBUSY') {
-        try {
-          if (fs.existsSync(lockPath)) {
-            let isProcessDead = false;
-            try {
-              const content = fs.readFileSync(lockPath, 'utf-8');
-              const data = JSON.parse(content);
-              if (typeof data.pid !== 'number') {
-                isProcessDead = true;
-              } else {
-                try {
-                  process.kill(data.pid, 0);
-                  isProcessDead = false;
-                } catch (killErr: any) {
-                  isProcessDead = killErr?.code === 'ESRCH';
-                }
-              }
-            } catch {
-              // Corrupt or unparseable lock file - safe to reclaim
-              isProcessDead = true;
-            }
-
-            // Strictly reclaim only when the holding process is confirmed dead.
-            // Do not delete active locks based solely on elapsed time.
-            if (isProcessDead) {
-              try {
-                fs.unlinkSync(lockPath);
-              } catch {}
-            }
-          }
-        } catch {}
-        sleepSync(20);
-        continue;
-      }
-      throw err;
-    }
-  }
-
-  if (!acquired) {
-    throw new Error('TIMEOUT: Failed to acquire DNS state lock within 5000ms.');
-  }
-
-  return () => {
-    try {
-      if (fs.existsSync(lockPath)) {
-        const content = fs.readFileSync(lockPath, 'utf-8');
-        const data = JSON.parse(content);
-        if (data.ownerToken === ownerToken) {
-          fs.unlinkSync(lockPath);
-        }
-      }
-    } catch {}
-  };
-}
-
-export function withDnsStateLock<T>(fn: () => T): T {
-  const release = acquireDnsStateLock();
-  try {
-    return fn();
-  } finally {
-    release();
-  }
-}
 
 export type DnsDeletionStatus =
   | 'pending'
@@ -492,12 +501,18 @@ export interface PendingDeletionRequest {
 }
 
 const PENDING_DELETION_REQUESTS = new Map<string, PendingDeletionRequest>();
-const CONSUMED_APPROVAL_TOKENS = new Set<string>();
+const CONSUMED_APPROVAL_TOKENS = new Map<string, number>(); // tokenHash -> retainUntil (epoch ms)
+
+export interface ConsumedTokenEntry {
+  hash: string;
+  retainUntil: number;
+}
 
 export interface DnsStatePayload {
   version: 1;
   requests: PendingDeletionRequest[];
-  consumedTokenHashes: string[];
+  consumedTokenHashes?: string[];
+  consumedTokens?: ConsumedTokenEntry[];
 }
 
 const ALLOWED_STATUSES = new Set<DnsDeletionStatus>([
@@ -532,8 +547,8 @@ export function validateDnsStatePayload(data: unknown): DnsStatePayload {
   if (!Array.isArray(obj.requests)) {
     throw new Error('Invalid state file: requests must be an array');
   }
-  if (!Array.isArray(obj.consumedTokenHashes)) {
-    throw new Error('Invalid state file: consumedTokenHashes must be an array');
+  if (!Array.isArray(obj.consumedTokenHashes) && !Array.isArray(obj.consumedTokens)) {
+    throw new Error('Invalid state file: consumedTokenHashes or consumedTokens must be an array');
   }
 
   const validRequests: PendingDeletionRequest[] = [];
@@ -598,15 +613,31 @@ export function validateDnsStatePayload(data: unknown): DnsStatePayload {
     });
   }
 
+  const validConsumedTokens: ConsumedTokenEntry[] = [];
+  if (Array.isArray(obj.consumedTokens)) {
+    for (const entry of obj.consumedTokens) {
+      if (typeof entry !== 'object' || entry === null) {
+        throw new Error('Invalid state file: consumedTokens entry must be an object');
+      }
+      const e = entry as Record<string, unknown>;
+      assertValidSha256(e.hash, 'consumedTokens hash');
+      assertValidTimestamp(e.retainUntil, 'consumedTokens retainUntil');
+      validConsumedTokens.push({ hash: (e.hash as string).toLowerCase(), retainUntil: e.retainUntil });
+    }
+  }
+
   const validHashes: string[] = [];
-  for (const h of obj.consumedTokenHashes) {
-    assertValidSha256(h, 'consumedTokenHashes entry');
-    validHashes.push(h.toLowerCase());
+  if (Array.isArray(obj.consumedTokenHashes)) {
+    for (const h of obj.consumedTokenHashes) {
+      assertValidSha256(h, 'consumedTokenHashes entry');
+      validHashes.push(h.toLowerCase());
+    }
   }
 
   return {
     version: 1,
     requests: validRequests,
+    consumedTokens: validConsumedTokens,
     consumedTokenHashes: validHashes
   };
 }
@@ -636,21 +667,33 @@ function loadDnsStateFromDisk(): void {
       for (const item of data.requests) {
         if (!item.requestId) continue;
         const isTerminal = item.status === 'completed' || item.status === 'failed';
-        if (!isTerminal && item.expiresAt > now) {
-          PENDING_DELETION_REQUESTS.set(item.requestId, item);
+        const needsRecovery = item.status === 'executing' || item.status === 'execution_unknown';
+        if (needsRecovery) {
+          if (now - item.createdAt < RETENTION_MS) {
+            PENDING_DELETION_REQUESTS.set(item.requestId, item);
+          }
         } else if (isTerminal) {
           const terminalTime = item.completedAt || item.expiresAt || item.createdAt;
           if (now - terminalTime < RETENTION_MS) {
             PENDING_DELETION_REQUESTS.set(item.requestId, item);
           }
-        } else if (item.status === 'execution_unknown') {
-          if (now - item.createdAt < RETENTION_MS) {
-            PENDING_DELETION_REQUESTS.set(item.requestId, item);
-          }
+        } else if (item.expiresAt > now) {
+          PENDING_DELETION_REQUESTS.set(item.requestId, item);
         }
       }
-      for (const hash of data.consumedTokenHashes) {
-        CONSUMED_APPROVAL_TOKENS.add(hash);
+
+      if (data.consumedTokens && data.consumedTokens.length > 0) {
+        for (const entry of data.consumedTokens) {
+          if (entry.retainUntil > now) {
+            CONSUMED_APPROVAL_TOKENS.set(entry.hash, entry.retainUntil);
+          }
+        }
+      } else if (data.consumedTokenHashes && data.consumedTokenHashes.length > 0) {
+        for (const hash of data.consumedTokenHashes) {
+          if (!CONSUMED_APPROVAL_TOKENS.has(hash)) {
+            CONSUMED_APPROVAL_TOKENS.set(hash, now + 24 * 60 * 60 * 1000);
+          }
+        }
       }
       return;
     } catch (err) {
@@ -687,9 +730,10 @@ function loadDnsStateFromDisk(): void {
     try {
       const data = JSON.parse(fs.readFileSync(legacyConsumedFile, 'utf-8'));
       if (Array.isArray(data)) {
+        const defaultRetain = Date.now() + 24 * 60 * 60 * 1000;
         for (const hash of data) {
           if (typeof hash === 'string') {
-            CONSUMED_APPROVAL_TOKENS.add(hash);
+            CONSUMED_APPROVAL_TOKENS.set(hash, defaultRetain);
           }
         }
       }
@@ -704,6 +748,16 @@ function loadDnsStateFromDisk(): void {
 function saveDnsStateToDisk(): void {
   const stateFile = getDnsStateFilePath();
   try {
+    const now = Date.now();
+    const activeConsumed: ConsumedTokenEntry[] = [];
+    for (const [hash, retainUntil] of CONSUMED_APPROVAL_TOKENS.entries()) {
+      if (retainUntil > now) {
+        activeConsumed.push({ hash, retainUntil });
+      } else {
+        CONSUMED_APPROVAL_TOKENS.delete(hash);
+      }
+    }
+
     const payload: DnsStatePayload = {
       version: 1,
       requests: Array.from(PENDING_DELETION_REQUESTS.values()).map((r) => ({
@@ -711,9 +765,10 @@ function saveDnsStateToDisk(): void {
         // Redact plaintext token so sensitive credentials are never stored on disk
         approvalToken: undefined
       })),
-      consumedTokenHashes: Array.from(CONSUMED_APPROVAL_TOKENS)
+      consumedTokens: activeConsumed,
+      consumedTokenHashes: activeConsumed.map((e) => e.hash)
     };
-    const tempStateFile = `${stateFile}.tmp.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+    const tempStateFile = `${stateFile}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
     fs.writeFileSync(tempStateFile, JSON.stringify(payload, null, 2), { encoding: 'utf-8', mode: 0o600 });
     fs.renameSync(tempStateFile, stateFile);
   } catch (err) {
@@ -750,6 +805,33 @@ export function registerOAuthClientForTesting(client: OAuthClient): void {
   OAUTH_CLIENTS.set(client.clientId, client);
 }
 
+const DNS_DELETION_RATE_LIMITS = new Map<string, { count: number; windowStart: number }>();
+
+/**
+ * Tenant-level rate limiter for DNS deletion operations.
+ * Protects against deletion flood and resource exhaustion.
+ */
+export function checkDnsDeletionRateLimit(tenantId: string, limit = 30, windowMs = 60000): boolean {
+  const now = Date.now();
+  const entry = DNS_DELETION_RATE_LIMITS.get(tenantId);
+  if (!entry || now - entry.windowStart >= windowMs) {
+    DNS_DELETION_RATE_LIMITS.set(tenantId, { count: 1, windowStart: now });
+    if (DNS_DELETION_RATE_LIMITS.size > 5000) {
+      for (const [k, v] of DNS_DELETION_RATE_LIMITS.entries()) {
+        if (now - v.windowStart >= windowMs) {
+          DNS_DELETION_RATE_LIMITS.delete(k);
+        }
+      }
+    }
+    return true;
+  }
+  if (entry.count >= limit) {
+    return false;
+  }
+  entry.count += 1;
+  return true;
+}
+
 /**
  * Clear test registries between test executions
  */
@@ -758,6 +840,7 @@ export function clearTestRegistries(): void {
   OAUTH_CLIENTS.clear();
   PENDING_DELETION_REQUESTS.clear();
   CONSUMED_APPROVAL_TOKENS.clear();
+  DNS_DELETION_RATE_LIMITS.clear();
   try {
     const stateFile = getDnsStateFilePath();
     if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile);
@@ -955,7 +1038,8 @@ export function verifyAuthToken(
         'dns:write',
         'usage:read'
       ],
-      livemode: false
+      livemode: false,
+      actorType: 'service'
     };
 
     return validateScopes(claims, token, options.requiredScopes);
@@ -1137,13 +1221,28 @@ export function verifyAuthToken(
         };
       }
 
+      const rawActorType: 'human' | 'service' | undefined =
+        payload.actor_type === 'human' ? 'human' : payload.actor_type === 'service' ? 'service' : undefined;
+
+      let rawAuthMethods: string[] | undefined;
+      if (Array.isArray(payload.auth_methods)) {
+        rawAuthMethods = (payload.auth_methods as unknown[]).filter((m): m is string => typeof m === 'string');
+      } else if (Array.isArray(payload.amr)) {
+        rawAuthMethods = (payload.amr as unknown[]).filter((m): m is string => typeof m === 'string');
+      }
+
+      const rawAuthTime = typeof payload.auth_time === 'number' ? payload.auth_time : undefined;
+
       const claims: AuthClaims = {
         actorId: rawActorId,
         tenantId: rawTenantId,
         tier: (payload.tier as AuthClaims['tier']) || 'developer',
         scopes,
         livemode: payload.livemode !== false,
-        expiresAt: payload.exp
+        expiresAt: payload.exp,
+        actorType: rawActorType,
+        authMethods: rawAuthMethods,
+        authTime: rawAuthTime
       };
 
       return validateScopes(claims, token, options.requiredScopes);
@@ -1169,7 +1268,8 @@ export function verifyAuthToken(
       tenantId: registered.tenantId,
       tier: registered.tier,
       scopes: registered.scopes,
-      livemode: true
+      livemode: true,
+      actorType: 'service'
     };
     return validateScopes(claims, token, options.requiredScopes);
   }
@@ -1190,7 +1290,8 @@ export function verifyAuthToken(
         'dns:write',
         'usage:read'
       ],
-      livemode: false
+      livemode: false,
+      actorType: 'service'
     };
     return validateScopes(claims, token, options.requiredScopes);
   }
@@ -1346,6 +1447,15 @@ export function authorizeDnsDeletionRequest(
     };
   }
 
+  // 1b. Reject service tokens (machine / bot identity cannot authorize human approval requests)
+  if (operatorClaims.actorType === 'service') {
+    return {
+      success: false,
+      status: 403,
+      error: 'Security Policy Violation: Service accounts and non-human actors cannot authorize DNS deletions.'
+    };
+  }
+
   return withDnsStateLock(() => {
     loadDnsStateFromDisk();
     const req = PENDING_DELETION_REQUESTS.get(requestId);
@@ -1460,7 +1570,10 @@ export function issueDnsDeletionChallenge(
       tenantId,
       tier: 'enterprise',
       scopes: [DNS_APPROVAL_SCOPE],
-      livemode: false
+      livemode: false,
+      actorType: 'human',
+      authMethods: ['mfa'],
+      authTime: Math.floor(Date.now() / 1000)
     },
     req.requestId,
     secret
@@ -1603,7 +1716,8 @@ export function verifyAndConsumeDnsDeletionApproval(
     req.status = 'executing';
     req.consumed = true;
     req.consumedAt = Date.now();
-    CONSUMED_APPROVAL_TOKENS.add(tokenHash);
+    const retainUntil = Date.now() + 24 * 60 * 60 * 1000;
+    CONSUMED_APPROVAL_TOKENS.set(tokenHash, retainUntil);
     saveDnsStateToDisk();
 
     return { valid: true, requestId: req.requestId };
@@ -1754,7 +1868,8 @@ export function issueOAuthAccessToken(client: OAuthClient): string {
     {
       sub: client.actorId,
       tenant_id: client.tenantId,
-      scopes: client.scopes
+      scopes: client.scopes,
+      actor_type: 'service'
     },
     { algorithm: 'RS256', kid: ACTIVE_KID }
   );
@@ -1930,4 +2045,5 @@ export function toRedactedDnsRequestDto(req: PendingDeletionRequest): DnsDeletio
 export function resetDnsStateForTesting(): void {
   PENDING_DELETION_REQUESTS.clear();
   CONSUMED_APPROVAL_TOKENS.clear();
+  DNS_DELETION_RATE_LIMITS.clear();
 }

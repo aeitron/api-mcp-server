@@ -11,6 +11,7 @@ import { AuditLogger } from '../audit.js';
 import {
   AuthClaims,
   checkToolAuthorization,
+  checkDnsDeletionRateLimit,
   createDnsDeletionRequest,
   verifyAndConsumeDnsDeletionApproval,
   markDnsDeletionCompleted,
@@ -281,6 +282,23 @@ export function registerDnsTools(
             {
               type: 'text',
               text: 'Forbidden: A valid authenticated tenant and actor are required for DNS deletion.'
+            }
+          ]
+        };
+      }
+
+      // 2b. Rate Limiting Guard: Rate limit DNS deletion operations per tenant
+      if (!checkDnsDeletionRateLimit(tenantId)) {
+        audit.logToolExecution('delete_dns_record', args, 0, false, {
+          tenantId: authClaims?.tenantId,
+          actorId: authClaims?.actorId
+        }, 'Rate limit exceeded on DNS deletion operations for this tenant');
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: '429 Too Many Requests: Rate limit exceeded on DNS deletion operations for this tenant.'
             }
           ]
         };

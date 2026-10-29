@@ -154,7 +154,10 @@ export async function handleDnsApproveDeletion(parsed: ParsedCliArgs): Promise<{
       tenantId: pending.tenantId,
       tier: 'enterprise',
       scopes: ['dns:delete:approve'],
-      livemode: false
+      livemode: false,
+      actorType: 'human',
+      authMethods: ['mfa'],
+      authTime: Math.floor(Date.now() / 1000)
     };
   } else {
     process.stderr.write('[aeitron-mcp] ERROR: Operator authentication token required (--token or AEITRON_API_KEY).\n');
