@@ -133,6 +133,31 @@ export function loadOAuthClientsFromEnv(rawClients?: string): void {
 loadAuthoritativeKeysFromEnv();
 loadOAuthClientsFromEnv();
 
+// Asymmetric Key Pair for RFC 7517 compliant JWKS public key distribution and RS256 signing
+const RSA_KEY_PAIR = crypto.generateKeyPairSync('rsa', {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+  privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+});
+
+const RSA_PUBLIC_KEY_OBJ = crypto.createPublicKey(RSA_KEY_PAIR.publicKey);
+const RSA_PUBLIC_JWK = RSA_PUBLIC_KEY_OBJ.export({ format: 'jwk' });
+
+// Pending deletion requests awaiting human operator approval
+export interface PendingDeletionRequest {
+  requestId: string;
+  tenantId: string;
+  actorId: string;
+  domain: string;
+  recordId: string;
+  createdAt: number;
+  expiresAt: number;
+  authorized: boolean;
+}
+
+const PENDING_DELETION_REQUESTS = new Map<string, PendingDeletionRequest>();
+const CONSUMED_APPROVAL_TOKENS = new Set<string>();
+
 /**
  * Exclusively for test suites to register test credentials in-memory.
  * Disallowed in production if environment is 'production'.
@@ -163,6 +188,8 @@ export function registerOAuthClientForTesting(client: OAuthClient): void {
 export function clearTestRegistries(): void {
   AUTHORITATIVE_KEYS.clear();
   OAUTH_CLIENTS.clear();
+  PENDING_DELETION_REQUESTS.clear();
+  CONSUMED_APPROVAL_TOKENS.clear();
 }
 
 /**
@@ -177,7 +204,9 @@ export function verifyOAuthClient(
   }
 
   const config = getConfig();
-  if (config.environment !== 'production' && clientId === 'aeitron_test_client_id' && clientSecret === 'secret_test_key_889') {
+  const isHardened = config.environment === 'production' || config.environment === 'staging';
+  // Test fixture credentials are strictly prohibited in hardened environments (staging & production)
+  if (!isHardened && clientId === 'aeitron_test_client_id' && clientSecret === 'secret_test_key_889') {
     return {
       success: true,
       client: {
@@ -273,12 +302,13 @@ export function verifyAuthToken(
   // 1. Sandbox / Development Credentials
   // --------------------------------------------------------------------------
   if (token.startsWith('atk_sandbox_') || token.startsWith('atk_test_')) {
-    if (isProd || !allowSandbox) {
+    const isHardened = isProd || config.environment === 'staging';
+    if (isHardened || !allowSandbox) {
       return {
         success: false,
         status: 401,
-        code: 'SANDBOX_DISABLED_IN_PROD',
-        error: 'Sandbox credentials are not permitted in production environments.'
+        code: isProd ? 'SANDBOX_DISABLED_IN_PROD' : 'SANDBOX_DISABLED_IN_HARDENED_ENV',
+        error: `Sandbox credentials are not permitted in ${config.environment} environments.`
       };
     }
 
@@ -301,38 +331,50 @@ export function verifyAuthToken(
   }
 
   // --------------------------------------------------------------------------
-  // 2. JWT Cryptographic Verification (HMAC-SHA256)
+  // 2. JWT Cryptographic Verification (RS256 & HMAC-SHA256)
   // --------------------------------------------------------------------------
   if (token.startsWith('eyJ') && token.split('.').length === 3) {
     const [headerB64, payloadB64, sigB64] = token.split('.');
 
     try {
-      // A. Verify cryptographic signature
-      const expectedSig = crypto
-        .createHmac('sha256', jwtSecret)
-        .update(`${headerB64}.${payloadB64}`)
-        .digest('base64url');
-
-      const sigBuffer = Buffer.from(sigB64, 'utf-8');
-      const expectedBuffer = Buffer.from(expectedSig, 'utf-8');
-
-      if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
-        return {
-          success: false,
-          status: 401,
-          code: 'INVALID_SIGNATURE',
-          error: 'Cryptographic JWT signature verification failed.'
-        };
-      }
-
-      // B. Decode header and payload
       const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf-8')) as Record<string, unknown>;
-      if (header.alg !== 'HS256') {
+      const content = `${headerB64}.${payloadB64}`;
+
+      if (header.alg === 'RS256') {
+        const verifier = crypto.createVerify('RSA-SHA256');
+        verifier.update(content);
+        const valid = verifier.verify(RSA_KEY_PAIR.publicKey, sigB64, 'base64url');
+        if (!valid) {
+          return {
+            success: false,
+            status: 401,
+            code: 'INVALID_SIGNATURE',
+            error: 'Cryptographic RS256 JWT signature verification failed against public key.'
+          };
+        }
+      } else if (header.alg === 'HS256') {
+        const expectedSig = crypto
+          .createHmac('sha256', jwtSecret)
+          .update(content)
+          .digest('base64url');
+
+        const sigBuffer = Buffer.from(sigB64, 'utf-8');
+        const expectedBuffer = Buffer.from(expectedSig, 'utf-8');
+
+        if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
+          return {
+            success: false,
+            status: 401,
+            code: 'INVALID_SIGNATURE',
+            error: 'Cryptographic JWT signature verification failed.'
+          };
+        }
+      } else {
         return {
           success: false,
           status: 401,
           code: 'UNSUPPORTED_ALGORITHM',
-          error: `Unsupported signing algorithm '${header.alg}'. Only HS256 is accepted.`
+          error: `Unsupported signing algorithm '${header.alg}'. Accepted algorithms: RS256, HS256.`
         };
       }
 
@@ -411,9 +453,43 @@ export function verifyAuthToken(
         };
       }
 
+      // H. Mandatory Actor Identity Check (P1: sub or actor_id must be present and non-empty)
+      const rawActorId = (typeof payload.sub === 'string' && payload.sub.trim()) ||
+                         (typeof payload.actor_id === 'string' && payload.actor_id.trim());
+      if (!rawActorId) {
+        return {
+          success: false,
+          status: 401,
+          code: 'MISSING_ACTOR_CLAIM',
+          error: 'JWT is missing mandatory actor claim ("sub" or "actor_id"). Synthetic identities are prohibited.'
+        };
+      }
+
+      // I. Mandatory Tenant Identity Check (P1: tenant_id or org_id must be present and non-empty)
+      const rawTenantId = (typeof payload.tenant_id === 'string' && payload.tenant_id.trim()) ||
+                          (typeof payload.org_id === 'string' && payload.org_id.trim());
+      if (!rawTenantId) {
+        return {
+          success: false,
+          status: 401,
+          code: 'MISSING_TENANT_CLAIM',
+          error: 'JWT is missing mandatory tenant claim ("tenant_id" or "org_id"). Synthetic identities are prohibited.'
+        };
+      }
+
+      // J. Strict Scope Format Validation
+      if (!Array.isArray(scopes) || !scopes.every((s) => typeof s === 'string' && s.trim().length > 0)) {
+        return {
+          success: false,
+          status: 401,
+          code: 'INVALID_SCOPES_CLAIM',
+          error: 'JWT scopes must be an array of non-empty strings.'
+        };
+      }
+
       const claims: AuthClaims = {
-        actorId: (payload.sub as string) || (payload.actor_id as string) || 'usr_jwt_user',
-        tenantId: (payload.tenant_id as string) || (payload.org_id as string) || 'tenant_jwt_workspace',
+        actorId: rawActorId,
+        tenantId: rawTenantId,
         tier: (payload.tier as AuthClaims['tier']) || 'developer',
         scopes,
         livemode: payload.livemode !== false,
@@ -540,10 +616,69 @@ export function checkToolAuthorization(
 }
 
 /**
- * Issues a cryptographically signed, short-lived challenge token for high-risk DNS deletions.
- * Prevents autonomous self-approval by LLM prompts.
+ * Creates a pending deletion request requiring human operator authorization.
+ * AI models are strictly prohibited from self-authorizing destructive actions.
  */
-export function issueDnsDeletionChallenge(
+export function createDnsDeletionRequest(
+  tenantId: string,
+  actorId: string,
+  domain: string,
+  recordId: string
+): { requestId: string; expiresAt: number } {
+  const requestId = `del_req_${crypto.randomBytes(16).toString('hex')}`;
+  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minute validity window
+
+  PENDING_DELETION_REQUESTS.set(requestId, {
+    requestId,
+    tenantId,
+    actorId,
+    domain,
+    recordId,
+    createdAt: Date.now(),
+    expiresAt,
+    authorized: false
+  });
+
+  return { requestId, expiresAt };
+}
+
+/**
+ * Authorizes a pending deletion request by a verified human operator and issues a single-use token.
+ */
+export function authorizeDnsDeletionRequest(
+  operatorClaims: AuthClaims,
+  requestId: string,
+  secret?: string
+): { success: true; token: string; expiresAt: number } | { success: false; error: string; status: number } {
+  if (!operatorClaims.scopes.includes('dns:write:delete') && !operatorClaims.scopes.includes('*')) {
+    return {
+      success: false,
+      status: 403,
+      error: 'Operator lacks "dns:write:delete" permission scope required to authorize deletion.'
+    };
+  }
+
+  const req = PENDING_DELETION_REQUESTS.get(requestId);
+  if (!req) {
+    return { success: false, status: 404, error: 'Pending deletion request not found or expired.' };
+  }
+  if (Date.now() > req.expiresAt) {
+    PENDING_DELETION_REQUESTS.delete(requestId);
+    return { success: false, status: 410, error: 'Pending deletion request has expired.' };
+  }
+  if (operatorClaims.tenantId !== 'anonymous' && req.tenantId !== operatorClaims.tenantId) {
+    return { success: false, status: 403, error: 'Operator tenant does not match deletion request tenant.' };
+  }
+
+  req.authorized = true;
+  const challenge = createAuthorizedDnsDeletionToken(req.tenantId, req.domain, req.recordId, secret);
+  return { success: true, token: challenge.token, expiresAt: challenge.expiresAt };
+}
+
+/**
+ * Creates an authorized, cryptographically signed, one-time deletion token.
+ */
+export function createAuthorizedDnsDeletionToken(
   tenantId: string,
   domain: string,
   recordId: string,
@@ -551,13 +686,15 @@ export function issueDnsDeletionChallenge(
 ): { token: string; expiresAt: number } {
   const config = getConfig();
   const signingSecret = secret || config.jwtSecret;
-  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minute validity window
+  const expiresAt = Date.now() + 5 * 60 * 1000;
+  const nonce = crypto.randomBytes(8).toString('hex');
 
   const payload = JSON.stringify({
     action: 'dns_delete_challenge',
     tenantId,
     domain,
     recordId,
+    nonce,
     expiresAt
   });
 
@@ -573,10 +710,14 @@ export function issueDnsDeletionChallenge(
   };
 }
 
+// Backwards-compatible alias for existing tests
+export const issueDnsDeletionChallenge = createAuthorizedDnsDeletionToken;
+
 /**
- * Verifies a DNS deletion approval challenge token
+ * Verifies and atomically consumes a DNS deletion approval challenge token.
+ * Enforces single-use replay protection.
  */
-export function verifyDnsDeletionChallenge(
+export function verifyAndConsumeDnsDeletionApproval(
   challengeToken: string,
   expectedTenantId: string,
   expectedDomain: string,
@@ -585,6 +726,11 @@ export function verifyDnsDeletionChallenge(
 ): { valid: boolean; error?: string } {
   if (!challengeToken || !challengeToken.startsWith('del_tok_')) {
     return { valid: false, error: 'Invalid challenge token format. Expected "del_tok_..." token.' };
+  }
+
+  const tokenHash = crypto.createHash('sha256').update(challengeToken).digest('hex');
+  if (CONSUMED_APPROVAL_TOKENS.has(tokenHash)) {
+    return { valid: false, error: 'Approval token has already been consumed (replay attempt detected).' };
   }
 
   const raw = challengeToken.slice('del_tok_'.length);
@@ -623,37 +769,72 @@ export function verifyDnsDeletionChallenge(
     if (expectedTenantId !== 'anonymous' && payload.tenantId !== expectedTenantId) {
       return { valid: false, error: 'Challenge approval token tenant mismatch.' };
     }
+
+    // Atomically consume token to prevent replay
+    CONSUMED_APPROVAL_TOKENS.add(tokenHash);
     return { valid: true };
   } catch {
     return { valid: false, error: 'Failed to decode challenge token payload.' };
   }
 }
 
+// Backwards-compatible alias
+export const verifyDnsDeletionChallenge = verifyAndConsumeDnsDeletionApproval;
+
 /**
- * Helper to generate cryptographically signed test JWTs for testing & OAuth flows
+ * Helper to generate cryptographically signed test JWTs for testing & OAuth flows.
+ * Supports both standard symmetric HS256 and asymmetric RS256 signing.
  */
 export function createSignedTestJwt(
   payload: Record<string, unknown>,
-  secret?: string
+  options?: { secret?: string; algorithm?: 'HS256' | 'RS256' } | string
 ): string {
   const config = getConfig();
+  const secret = typeof options === 'string' ? options : options?.secret;
+  const alg = (typeof options === 'object' && options?.algorithm) || 'HS256';
   const signingSecret = secret || config.jwtSecret;
 
-  const headerB64 = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const payloadB64 = Buffer.from(JSON.stringify({
+  const headerB64 = Buffer.from(JSON.stringify({
+    alg,
+    typ: 'JWT',
+    kid: alg === 'RS256' ? 'aeitron-mcp-rsa-2026-v1' : undefined
+  })).toString('base64url');
+
+  const defaultPayload: Record<string, unknown> = {
     iss: 'https://api.aeitron.com',
     aud: 'aeitron-mcp',
     exp: Math.floor(Date.now() / 1000) + 3600,
-    scopes: ['account:read', 'projects:read', 'dns:read', 'usage:read'],
+    scopes: ['account:read', 'projects:read', 'dns:read', 'usage:read']
+  };
+
+  if (!('sub' in payload) && !('actor_id' in payload)) {
+    defaultPayload.sub = 'usr_test_client';
+  }
+  if (!('tenant_id' in payload) && !('org_id' in payload)) {
+    defaultPayload.tenant_id = 'tenant_test_workspace';
+  }
+
+  const payloadB64 = Buffer.from(JSON.stringify({
+    ...defaultPayload,
     ...payload
   })).toString('base64url');
 
+  const content = `${headerB64}.${payloadB64}`;
+
+  if (alg === 'RS256') {
+    const signature = crypto
+      .createSign('RSA-SHA256')
+      .update(content)
+      .sign(RSA_KEY_PAIR.privateKey, 'base64url');
+    return `${content}.${signature}`;
+  }
+
   const signature = crypto
     .createHmac('sha256', signingSecret)
-    .update(`${headerB64}.${payloadB64}`)
+    .update(content)
     .digest('base64url');
 
-  return `${headerB64}.${payloadB64}.${signature}`;
+  return `${content}.${signature}`;
 }
 
 /**
@@ -684,16 +865,18 @@ export function getOAuthDiscoveryMetadata(publicBaseUrl: string): Record<string,
 }
 
 /**
- * Returns RFC 7517 compliant JSON Web Key Set (JWKS) metadata
+ * Returns RFC 7517 compliant JSON Web Key Set (JWKS) metadata with real RSA public key
  */
 export function getJwksMetadata(): { keys: Array<Record<string, unknown>> } {
   return {
     keys: [
       {
-        kty: 'oct',
+        kty: 'RSA',
         use: 'sig',
-        alg: 'HS256',
-        kid: 'aeitron-mcp-key-2026-v1'
+        alg: 'RS256',
+        kid: 'aeitron-mcp-rsa-2026-v1',
+        n: RSA_PUBLIC_JWK.n,
+        e: RSA_PUBLIC_JWK.e
       }
     ]
   };

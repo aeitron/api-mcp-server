@@ -18,7 +18,24 @@ export interface McpServerConfig {
 }
 
 export function getConfig(): McpServerConfig {
-  const rawEnv = (process.env.AEITRON_ENV || 'development').trim().toLowerCase();
+  const nodeEnv = (process.env.NODE_ENV || '').trim().toLowerCase();
+  const rawAeitronEnv = process.env.AEITRON_ENV ? process.env.AEITRON_ENV.trim().toLowerCase() : undefined;
+
+  let rawEnv: string;
+  if (rawAeitronEnv) {
+    // Conflict detection: if NODE_ENV is production but AEITRON_ENV claims development/test, fail closed
+    if ((nodeEnv === 'production' || nodeEnv === 'prod') && (rawAeitronEnv === 'development' || rawAeitronEnv === 'dev')) {
+      throw new Error(`FATAL CONFIGURATION ERROR: Conflicting environment configuration. NODE_ENV is 'production' but AEITRON_ENV is '${rawAeitronEnv}'. Explicitly align or configure AEITRON_ENV.`);
+    }
+    rawEnv = rawAeitronEnv;
+  } else if (nodeEnv === 'production' || nodeEnv === 'prod') {
+    // When deployed in a production container without explicit AEITRON_ENV, fail-safely default to production
+    rawEnv = 'production';
+  } else if (nodeEnv === 'test') {
+    rawEnv = 'test';
+  } else {
+    rawEnv = 'development';
+  }
   
   let environment: 'development' | 'staging' | 'production' | 'test';
   if (rawEnv === 'production' || rawEnv === 'prod') {
@@ -34,35 +51,35 @@ export function getConfig(): McpServerConfig {
     throw new Error(`FATAL CONFIGURATION ERROR: Invalid AEITRON_ENV '${rawEnv}'. Permitted environments: development, staging, production, test.`);
   }
 
-  const isProd = environment === 'production';
+  const isHardened = environment === 'production' || environment === 'staging';
 
-  // 1. Strict Fail-Closed Mock Fallback Guard
+  // 1. Strict Fail-Closed Mock Fallback Guard (prohibited in production and staging)
   const explicitMock = process.env.AEITRON_MOCK_FALLBACK;
-  if (isProd && explicitMock === 'true') {
-    throw new Error('FATAL CONFIGURATION ERROR: AEITRON_MOCK_FALLBACK cannot be enabled in production.');
+  if (isHardened && explicitMock === 'true') {
+    throw new Error(`FATAL CONFIGURATION ERROR: AEITRON_MOCK_FALLBACK cannot be enabled in ${environment}.`);
   }
-  const mockFallback = isProd ? false : explicitMock === 'true';
+  const mockFallback = isHardened ? false : explicitMock === 'true';
 
-  // 2. Cryptographic JWT Secret
-  const jwtSecret = process.env.AEITRON_JWT_SECRET || (isProd ? '' : 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890');
-  if (isProd && (!jwtSecret || jwtSecret.length < 32)) {
-    throw new Error('FATAL CONFIGURATION ERROR: AEITRON_JWT_SECRET must be at least 32 characters in production.');
+  // 2. Cryptographic JWT Secret (strictly required in production and staging)
+  const jwtSecret = process.env.AEITRON_JWT_SECRET || (isHardened ? '' : 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890');
+  if (isHardened && (!jwtSecret || jwtSecret.length < 32)) {
+    throw new Error(`FATAL CONFIGURATION ERROR: AEITRON_JWT_SECRET must be at least 32 characters in ${environment}.`);
   }
 
   // 3. CORS Allowed Origins
   const rawCors = process.env.AEITRON_CORS_ORIGINS;
   const corsAllowedOrigins = rawCors
     ? rawCors.split(',').map((s) => s.trim()).filter(Boolean)
-    : isProd
+    : isHardened
     ? ['https://chatgpt.com', 'https://claude.ai', 'https://console.aeitron.com', 'https://api.aeitron.com']
     : ['*'];
 
-  // 4. Sandbox Credentials Allowed (Only in non-production)
-  const allowSandbox = !isProd && process.env.AEITRON_ALLOW_SANDBOX !== 'false';
+  // 4. Sandbox Credentials Allowed (Only in development and test)
+  const allowSandbox = !isHardened && process.env.AEITRON_ALLOW_SANDBOX !== 'false';
 
   return {
     apiBaseUrl: (process.env.AEITRON_API_BASE_URL || 'http://localhost:8080').replace(/\/+$/, ''),
-    defaultApiKey: process.env.AEITRON_API_KEY || (isProd ? undefined : 'atk_sandbox_dev_default_key'),
+    defaultApiKey: process.env.AEITRON_API_KEY || (isHardened ? undefined : 'atk_sandbox_dev_default_key'),
     environment,
     mockFallback,
     requestTimeoutMs: parseInt(process.env.AEITRON_REQUEST_TIMEOUT_MS || '8000', 10),

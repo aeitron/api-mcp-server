@@ -11,7 +11,9 @@ import { AuditLogger } from '../audit.js';
 import {
   AuthClaims,
   checkToolAuthorization,
+  createDnsDeletionRequest,
   issueDnsDeletionChallenge,
+  verifyAndConsumeDnsDeletionApproval,
   verifyDnsDeletionChallenge
 } from '../auth.js';
 
@@ -243,10 +245,11 @@ export function registerDnsTools(
       }
 
       const tenantId = authClaims?.tenantId || 'anonymous';
+      const actorId = authClaims?.actorId || 'anonymous_user';
 
       // 2. Handle Dry Run Preview
       if (args.dryRun === true) {
-        const challenge = issueDnsDeletionChallenge(tenantId, args.domain, args.recordId);
+        const req = createDnsDeletionRequest(tenantId, actorId, args.domain, args.recordId);
         audit.logToolExecution('delete_dns_record_preview', args, 0, true, {
           tenantId: authClaims?.tenantId,
           actorId: authClaims?.actorId
@@ -260,9 +263,15 @@ export function registerDnsTools(
                 `- **Domain Zone:** \`${args.domain}\``,
                 `- **Target Record ID:** \`${args.recordId}\``,
                 `- **Impact:** Deleting this record will stop resolving live traffic for this DNS name.`,
-                `- **Operator Approval Token:** \`${challenge.token}\``,
-                `- **Expires:** In 5 minutes (${new Date(challenge.expiresAt).toISOString()})`,
-                `- **Action Required:** To execute, human operator must approve and re-invoke delete_dns_record with \`approvalToken: "${challenge.token}"\`, \`confirm: true\`, and \`dryRun: false\`.`
+                `- **Deletion Request ID:** \`${req.requestId}\``,
+                `- **Status:** Awaiting Human Operator Authorization`,
+                `- **Expires:** In 5 minutes (${new Date(req.expiresAt).toISOString()})`,
+                ``,
+                `**HUMAN OPERATOR AUTHORIZATION REQUIRED:**`,
+                `AI models are strictly prohibited from self-authorizing destructive resource deletions.`,
+                `To execute this deletion, a verified human operator must authorize request ID \`${req.requestId}\` in the Aeitron Console or CLI:`,
+                `  \`aeitron dns approve-deletion --request-id ${req.requestId}\``,
+                `Then re-invoke \`delete_dns_record\` with \`approvalToken\`, \`confirm: true\`, and \`dryRun: false\`.`
               ].join('\n')
             }
           ]
@@ -271,7 +280,7 @@ export function registerDnsTools(
 
       // 3. Challenge Guard: Reject if no approval token is provided (prevents LLM self-authorization)
       if (!args.approvalToken) {
-        const challenge = issueDnsDeletionChallenge(tenantId, args.domain, args.recordId);
+        const req = createDnsDeletionRequest(tenantId, actorId, args.domain, args.recordId);
         audit.logToolExecution('delete_dns_record', args, 0, false, {
           tenantId: authClaims?.tenantId,
           actorId: authClaims?.actorId
@@ -283,21 +292,25 @@ export function registerDnsTools(
               type: 'text',
               text: [
                 `⚠️ SAFETY GUARD: Deleting a DNS record is a destructive action that can disrupt live production traffic.`,
-                `To prevent unintended LLM self-authorization, an explicit human approval challenge is required.`,
+                `AI models are strictly prohibited from self-authorizing destructive actions.`,
                 ``,
-                `Please ask the human user to confirm the deletion. Once confirmed, re-invoke this tool with:`,
-                `- \`approvalToken\`: \`${challenge.token}\``,
-                `- \`confirm\`: \`true\``,
-                `- \`dryRun\`: \`false\``,
-                `*(Token expires in 5 minutes)*`
+                `Deletion Request ID generated: \`${req.requestId}\``,
+                `Please ask the human operator to authorize this deletion via the Aeitron Console or CLI:`,
+                `  \`aeitron dns approve-deletion --request-id ${req.requestId}\``,
+                ``,
+                `Once approved by the operator, re-invoke this tool with:`,
+                `- \`approvalToken\`: "<one_time_token_from_operator>"`,
+                `- \`confirm\`: true`,
+                `- \`dryRun\`: false`,
+                `*(Request expires in 5 minutes)*`
               ].join('\n')
             }
           ]
         };
       }
 
-      // 4. Verify Cryptographic Challenge Approval Token
-      const tokenVerification = verifyDnsDeletionChallenge(args.approvalToken, tenantId, args.domain, args.recordId);
+      // 4. Verify & Atomically Consume Cryptographic Challenge Approval Token (Replay Protected)
+      const tokenVerification = verifyAndConsumeDnsDeletionApproval(args.approvalToken, tenantId, args.domain, args.recordId);
       if (!tokenVerification.valid) {
         audit.logToolExecution('delete_dns_record', args, 0, false, {
           tenantId: authClaims?.tenantId,

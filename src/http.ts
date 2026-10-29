@@ -13,6 +13,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createAeitronMcpServer } from './server.js';
 import {
+  AuthClaims,
   extractTokenFromRequest,
   verifyAuthToken,
   getOAuthDiscoveryMetadata,
@@ -47,10 +48,18 @@ export function createMcpHttpServer(
   const config = { ...getConfig(), ...customConfig };
   const app = new Hono();
   const activeSessions = new Map<string, ActiveSession>();
+  const streamableSessions = new Map<string, {
+    transport: StreamableHTTPServerTransport;
+    serverInstance: ReturnType<typeof createAeitronMcpServer>;
+    claims: AuthClaims;
+    createdAt: number;
+    lastActiveAt: number;
+  }>();
   const startTime = Date.now();
 
-  // In non-production/test environments, register a default OAuth test client if none exists
-  if (config.environment !== 'production') {
+  const isHardened = config.environment === 'production' || config.environment === 'staging';
+  // Test fixture OAuth client is strictly restricted to non-hardened environments (dev and test)
+  if (!isHardened) {
     registerOAuthClientForTesting({
       clientId: 'aeitron_test_client_id',
       clientSecretHash: 'ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f', // hash of 'secret_test_key_889'
@@ -70,8 +79,20 @@ export function createMcpHttpServer(
       return null;
     },
     allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'X-Tenant-ID', 'Mcp-Session-Id', 'Last-Event-ID'],
-    exposeHeaders: ['X-Request-ID', 'X-Session-ID', 'Mcp-Session-Id'],
+    allowHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Request-ID',
+      'X-Tenant-ID',
+      'Mcp-Session-Id',
+      'Last-Event-ID',
+      'MCP-Protocol-Version',
+      'Mcp-Protocol-Version',
+      'Mcp-Method',
+      'Mcp-Name',
+      'X-Aeitron-Approval-Token'
+    ],
+    exposeHeaders: ['X-Request-ID', 'X-Session-ID', 'Mcp-Session-Id', 'MCP-Protocol-Version', 'Mcp-Protocol-Version'],
     maxAge: 86400
   }));
 
@@ -83,7 +104,7 @@ export function createMcpHttpServer(
       version: '1.0.0',
       environment: config.environment,
       uptimeSeconds: Math.floor((Date.now() - startTime) / 1000),
-      activeSessions: activeSessions.size,
+      activeSessions: activeSessions.size + streamableSessions.size,
       mockFallbackEnabled: config.mockFallback
     });
   });
@@ -231,12 +252,18 @@ export function createMcpHttpServer(
       if (isOriginAllowed && allowedOriginHeader) {
         res.setHeader('Access-Control-Allow-Origin', allowedOriginHeader);
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Request-ID, X-Tenant-ID, Mcp-Session-Id, Last-Event-ID');
-        res.setHeader('Access-Control-Expose-Headers', 'X-Request-ID, X-Session-ID, Mcp-Session-Id');
+        res.setHeader(
+          'Access-Control-Allow-Headers',
+          'Content-Type, Authorization, X-Request-ID, X-Tenant-ID, Mcp-Session-Id, Last-Event-ID, MCP-Protocol-Version, Mcp-Protocol-Version, Mcp-Method, Mcp-Name, X-Aeitron-Approval-Token'
+        );
+        res.setHeader(
+          'Access-Control-Expose-Headers',
+          'X-Request-ID, X-Session-ID, Mcp-Session-Id, MCP-Protocol-Version, Mcp-Protocol-Version'
+        );
         res.setHeader('Access-Control-Max-Age', '86400');
-      } else if (config.environment === 'production') {
+      } else if (config.environment === 'production' || config.environment === 'staging') {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `CORS policy error: Origin '${origin}' is not allowed in production.` }));
+        res.end(JSON.stringify({ error: `CORS policy error: Origin '${origin}' is not allowed in ${config.environment}.` }));
         return;
       }
     }
@@ -249,7 +276,7 @@ export function createMcpHttpServer(
     }
 
     // B. Modern Streamable HTTP Endpoint (/mcp)
-    if (pathname === '/mcp' && req.method === 'POST') {
+    if (pathname === '/mcp') {
       const { token: rawToken } = extractTokenFromRequest(req, parsedUrl);
       const auth = verifyAuthToken(rawToken, {
         isProduction: config.environment === 'production',
@@ -271,21 +298,102 @@ export function createMcpHttpServer(
         return;
       }
 
-      // Initialize dedicated server and streamable transport
-      const apiClient = new AeitronApiClient({
-        ...config,
-        defaultApiKey: auth.token
-      });
+      const sessionIdHeader = (req.headers['mcp-session-id'] as string) || parsedUrl.searchParams.get('sessionId') || undefined;
 
-      const serverInstance = createAeitronMcpServer({
-        config,
-        client: apiClient,
-        authClaims: auth.claims
-      });
+      // Handle DELETE to explicitly terminate a session
+      if (req.method === 'DELETE') {
+        if (sessionIdHeader && streamableSessions.has(sessionIdHeader)) {
+          const session = streamableSessions.get(sessionIdHeader)!;
+          await session.transport.close();
+          await session.serverInstance.server.close();
+          streamableSessions.delete(sessionIdHeader);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'session_terminated', sessionId: sessionIdHeader }));
+          return;
+        }
+        res.writeHead(404, { 'Content-Type': 'application/problem+json' });
+        res.end(JSON.stringify({
+          type: 'https://aeitron.com/errors/session-not-found',
+          title: 'Session Not Found',
+          status: 404,
+          detail: `Streamable HTTP session '${sessionIdHeader}' not found.`
+        }));
+        return;
+      }
 
-      const streamableTransport = new StreamableHTTPServerTransport();
-      await serverInstance.server.connect(streamableTransport);
-      await streamableTransport.handleRequest(req, res);
+      // Handle GET for SSE streaming connection on an existing session
+      if (req.method === 'GET') {
+        if (sessionIdHeader && streamableSessions.has(sessionIdHeader)) {
+          const session = streamableSessions.get(sessionIdHeader)!;
+          session.lastActiveAt = Date.now();
+          await session.transport.handleRequest(req, res);
+          return;
+        }
+        res.writeHead(404, { 'Content-Type': 'application/problem+json' });
+        res.end(JSON.stringify({
+          type: 'https://aeitron.com/errors/session-not-found',
+          title: 'Session Not Found',
+          status: 404,
+          detail: `Streamable HTTP session '${sessionIdHeader}' not found.`
+        }));
+        return;
+      }
+
+      // Handle POST for JSON-RPC operations
+      if (req.method === 'POST') {
+        if (sessionIdHeader) {
+          const session = streamableSessions.get(sessionIdHeader);
+          if (!session) {
+            res.writeHead(404, { 'Content-Type': 'application/problem+json' });
+            res.end(JSON.stringify({
+              type: 'https://aeitron.com/errors/session-not-found',
+              title: 'Session Not Found',
+              status: 404,
+              detail: `Streamable HTTP session '${sessionIdHeader}' was not found or has expired.`
+            }));
+            return;
+          }
+          session.lastActiveAt = Date.now();
+          await session.transport.handleRequest(req, res);
+          return;
+        }
+
+        // Fresh session initialization or stateless invocation
+        const sessionId = crypto.randomUUID();
+        const apiClient = new AeitronApiClient({
+          ...config,
+          defaultApiKey: auth.token
+        });
+
+        const serverInstance = createAeitronMcpServer({
+          config,
+          client: apiClient,
+          authClaims: auth.claims
+        });
+
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => sessionId,
+          enableJsonResponse: true,
+          onsessionclosed: (closedId) => {
+            streamableSessions.delete(closedId);
+          }
+        });
+
+        await serverInstance.server.connect(transport);
+        streamableSessions.set(sessionId, {
+          transport,
+          serverInstance,
+          claims: auth.claims,
+          createdAt: Date.now(),
+          lastActiveAt: Date.now()
+        });
+
+        await transport.handleRequest(req, res);
+        return;
+      }
+
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method Not Allowed. Use GET, POST, or DELETE for /mcp.' }));
       return;
     }
 
@@ -429,6 +537,16 @@ export function createMcpHttpServer(
         }
       }
       activeSessions.clear();
+
+      for (const session of streamableSessions.values()) {
+        try {
+          await session.transport.close();
+          await session.serverInstance.server.close();
+        } catch {
+          // ignore during shutdown
+        }
+      }
+      streamableSessions.clear();
 
       await new Promise<void>((resolve, reject) => {
         httpServer.close((err) => (err ? reject(err) : resolve()));

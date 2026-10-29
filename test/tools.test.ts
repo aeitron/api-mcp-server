@@ -222,7 +222,7 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     assert.equal(json.value, '198.51.100.55');
   });
 
-  it('10. delete_dns_record Challenge Guard: fails closed with operator challenge token when approvalToken is missing', async () => {
+  it('10. delete_dns_record Challenge Guard: fails closed with operator challenge request ID when approvalToken is missing', async () => {
     const result = await client.callTool({
       name: 'delete_dns_record',
       arguments: {
@@ -235,10 +235,10 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     assert.equal(result.isError, true);
     const content = result.content as Array<{ text: string }>;
     assert.ok(content[0].text.includes('SAFETY GUARD'));
-    assert.ok(content[0].text.includes('del_tok_'));
+    assert.ok(content[0].text.includes('del_req_'));
   });
 
-  it('11. delete_dns_record Dry Run: returns safe impact preview with challenge token without mutating DNS', async () => {
+  it('11. delete_dns_record Dry Run: returns safe impact preview with deletion request ID without mutating DNS', async () => {
     const result = await client.callTool({
       name: 'delete_dns_record',
       arguments: {
@@ -252,7 +252,7 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     const content = result.content as Array<{ text: string }>;
     assert.ok(content[0].text.includes('DRY RUN PREVIEW'));
     assert.ok(content[0].text.includes('rec_dns_cname_003'));
-    assert.ok(content[0].text.includes('del_tok_'));
+    assert.ok(content[0].text.includes('del_req_'));
   });
 
   it('12. delete_dns_record: executes permanent deletion when valid approvalToken and confirm are provided', async () => {
@@ -273,6 +273,21 @@ describe('Aeitron MCP Tools Suite (Phase 1 & Phase 2 Security)', () => {
     assert.ok(content[0].text.includes('DNS Record Deleted Successfully'));
     const json = JSON.parse(content[1].text);
     assert.equal(json.success, true);
+
+    // Replaying the exact same token must immediately fail with replay detection
+    const replayResult = await client.callTool({
+      name: 'delete_dns_record',
+      arguments: {
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_cname_003',
+        confirm: true,
+        approvalToken: challenge.token
+      }
+    });
+
+    assert.equal(replayResult.isError, true);
+    const replayContent = replayResult.content as Array<{ text: string }>;
+    assert.ok(replayContent[0].text.includes('replay attempt detected'));
   });
 
   it('13. delete_dns_record: rejects invalid or forged approvalToken with 403 Forbidden', async () => {

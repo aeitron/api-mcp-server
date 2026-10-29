@@ -2,6 +2,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMcpHttpServer, McpHttpServerInstance } from '../src/http.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 
 describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
@@ -55,12 +56,15 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     assert.deepEqual(meta.grant_types_supported, ['client_credentials']);
   });
 
-  it('4. GET /.well-known/jwks.json: returns compliant JWKS public key metadata', async () => {
+  it('4. GET /.well-known/jwks.json: returns compliant JWKS public key metadata with RSA public key', async () => {
     const res = await fetch(`${baseUrl}/.well-known/jwks.json`);
     assert.equal(res.status, 200);
-    const body = await res.json() as { keys: Array<{ kty: string; alg: string }> };
+    const body = await res.json() as { keys: Array<{ kty: string; alg: string; n: string; e: string }> };
     assert.ok(Array.isArray(body.keys));
-    assert.equal(body.keys[0].alg, 'HS256');
+    assert.equal(body.keys[0].kty, 'RSA');
+    assert.equal(body.keys[0].alg, 'RS256');
+    assert.ok(typeof body.keys[0].n === 'string');
+    assert.ok(typeof body.keys[0].e === 'string');
   });
 
   it('5. POST /v1/auth/token: strictly rejects unauthenticated callers with 401 invalid_client', async () => {
@@ -181,5 +185,70 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
     assert.equal(res.status, 404);
     const body = await res.json() as { error: string };
     assert.ok(body.error.includes('not found'));
+  });
+
+  it('13. Streamable HTTP Round-Trip: connects client over POST /mcp and executes complete tools/list and tools/call workflow', async () => {
+    const mcpUrl = new URL(`${baseUrl}/mcp`);
+    const transport = new StreamableHTTPClientTransport(mcpUrl, {
+      requestInit: {
+        headers: {
+          'Authorization': 'Bearer atk_sandbox_live_e2e_test'
+        }
+      }
+    });
+
+    const client = new Client({
+      name: 'aeitron-streamable-test-client',
+      version: '1.0.0'
+    });
+
+    await client.connect(transport);
+
+    // Verify tool discovery over Streamable HTTP
+    const toolList = await client.listTools();
+    const names = toolList.tools.map((t) => t.name);
+    assert.ok(names.includes('get_account'));
+    assert.ok(names.includes('get_dns_records'));
+
+    // Verify tool execution over Streamable HTTP
+    const result = await client.callTool({
+      name: 'get_account',
+      arguments: {}
+    });
+
+    assert.equal(result.isError, undefined);
+    const content = result.content as Array<{ text: string }>;
+    assert.ok(content[0].text.includes('Aeitron Account Overview'));
+
+    await client.close();
+  });
+
+  it('14. CORS Preflight & Protocol Headers: validates MCP-Protocol-Version in preflight headers', async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: 'OPTIONS',
+      headers: {
+        'Origin': 'https://chatgpt.com',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'Content-Type, Authorization, MCP-Protocol-Version'
+      }
+    });
+
+    assert.equal(res.status, 204);
+    const allowHeaders = res.headers.get('access-control-allow-headers') || '';
+    assert.ok(allowHeaders.includes('MCP-Protocol-Version'));
+    assert.ok(allowHeaders.includes('Mcp-Method'));
+  });
+
+  it('15. Security Gate: rejects unauthenticated Streamable HTTP connection with 401 Unauthorized', async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'initialize', id: 1 })
+    });
+
+    assert.equal(res.status, 401);
+    const problem = await res.json() as { type: string; status: number };
+    assert.equal(problem.status, 401);
+    assert.ok(problem.type.includes('unauthorized'));
   });
 });

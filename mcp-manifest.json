@@ -12,7 +12,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aeitron/mcp-server"
+    "url": "https://github.com/aeitron/api-mcp-server"
   },
   "homepage": "https://aeitron.com/mcp",
   "privacyPolicyUrl": "https://aeitron.com/privacy",
@@ -22,6 +22,9 @@
     "png": "https://assets.aeitron.com/brand/icon-128.png"
   },
   "transport": {
+    "streamableHttp": {
+      "endpoint": "https://api.aeitron.com/mcp"
+    },
     "stdio": {
       "command": "node",
       "args": ["dist/cli.js"]

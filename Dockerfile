@@ -27,6 +27,7 @@ COPY --chown=aeitron:aeitron --from=builder /app/dist ./dist
 USER 10001:10001
 
 ENV NODE_ENV=production \
+    AEITRON_ENV=production \
     PORT=3005 \
     HOST=0.0.0.0
 

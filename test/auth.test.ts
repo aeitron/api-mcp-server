@@ -228,6 +228,7 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
   it('rejects expired JWT token with 401 TOKEN_EXPIRED', () => {
     const expiredJwt = createSignedTestJwt({
       sub: 'usr_expired',
+      tenant_id: 'tenant_expired',
       exp: 1000 // Year 1970
     });
 
@@ -236,6 +237,53 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     if (!result.success) {
       assert.equal(result.status, 401);
       assert.equal(result.code, 'TOKEN_EXPIRED');
+    }
+  });
+
+  it('rejects JWT missing mandatory actor (sub) claim with 401 MISSING_ACTOR_CLAIM', () => {
+    const noActorJwt = createSignedTestJwt({
+      sub: '',
+      actor_id: ''
+    });
+
+    const result = verifyAuthToken(noActorJwt);
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.equal(result.status, 401);
+      assert.equal(result.code, 'MISSING_ACTOR_CLAIM');
+    }
+  });
+
+  it('rejects JWT missing mandatory tenant claim with 401 MISSING_TENANT_CLAIM', () => {
+    const noTenantJwt = createSignedTestJwt({
+      tenant_id: '',
+      org_id: ''
+    });
+
+    const result = verifyAuthToken(noTenantJwt);
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.equal(result.status, 401);
+      assert.equal(result.code, 'MISSING_TENANT_CLAIM');
+    }
+  });
+
+  it('verifies cryptographically signed RS256 JWT using RSA public key', () => {
+    const rsaJwt = createSignedTestJwt(
+      {
+        sub: 'usr_rsa_user_1',
+        tenant_id: 'tenant_rsa_workspace',
+        scopes: ['account:read', 'dns:read']
+      },
+      { algorithm: 'RS256' }
+    );
+
+    const result = verifyAuthToken(rsaJwt);
+    assert.equal(result.success, true);
+    if (result.success) {
+      assert.equal(result.claims.actorId, 'usr_rsa_user_1');
+      assert.equal(result.claims.tenantId, 'tenant_rsa_workspace');
+      assert.ok(result.claims.scopes.includes('dns:read'));
     }
   });
 
@@ -252,26 +300,33 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     assert.ok(result.error?.includes('Unmapped tool'));
   });
 
-  it('issues and verifies cryptographic DNS deletion challenge tokens', () => {
+  it('issues and verifies cryptographic DNS deletion challenge tokens with single-use replay protection', () => {
     const challenge = issueDnsDeletionChallenge('tenant_acme', 'aeitron.com', 'rec_01');
     assert.ok(challenge.token.startsWith('del_tok_'));
     assert.ok(challenge.expiresAt > Date.now());
 
-    // Valid verification
+    // Valid verification and atomic consumption
     const verified = verifyDnsDeletionChallenge(challenge.token, 'tenant_acme', 'aeitron.com', 'rec_01');
     assert.equal(verified.valid, true);
 
-    // Mismatched domain verification
-    const badDomain = verifyDnsDeletionChallenge(challenge.token, 'tenant_acme', 'other-domain.com', 'rec_01');
+    // Replay attempt must be strictly rejected
+    const replayAttempt = verifyDnsDeletionChallenge(challenge.token, 'tenant_acme', 'aeitron.com', 'rec_01');
+    assert.equal(replayAttempt.valid, false);
+    assert.ok(replayAttempt.error?.includes('replay'));
+
+    // Mismatched domain verification on a fresh token
+    const freshChallenge1 = issueDnsDeletionChallenge('tenant_acme', 'aeitron.com', 'rec_01');
+    const badDomain = verifyDnsDeletionChallenge(freshChallenge1.token, 'tenant_acme', 'other-domain.com', 'rec_01');
     assert.equal(badDomain.valid, false);
     assert.ok(badDomain.error?.includes('match'));
 
-    // Mismatched recordId verification
-    const badRecord = verifyDnsDeletionChallenge(challenge.token, 'tenant_acme', 'aeitron.com', 'rec_wrong_99');
+    // Mismatched recordId verification on a fresh token
+    const freshChallenge2 = issueDnsDeletionChallenge('tenant_acme', 'aeitron.com', 'rec_01');
+    const badRecord = verifyDnsDeletionChallenge(freshChallenge2.token, 'tenant_acme', 'aeitron.com', 'rec_wrong_99');
     assert.equal(badRecord.valid, false);
 
     // Forged signature verification
-    const forgedToken = challenge.token.slice(0, -6) + 'abcdef';
+    const forgedToken = freshChallenge2.token.slice(0, -6) + 'abcdef';
     const badSig = verifyDnsDeletionChallenge(forgedToken, 'tenant_acme', 'aeitron.com', 'rec_01');
     assert.equal(badSig.valid, false);
   });
@@ -283,11 +338,13 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     assert.deepEqual(meta.grant_types_supported, ['client_credentials']);
   });
 
-  it('returns compliant RFC 7517 JWKS metadata', () => {
+  it('returns compliant RFC 7517 JWKS metadata with valid RSA public key', () => {
     const jwks = getJwksMetadata();
     assert.ok(Array.isArray(jwks.keys));
     assert.equal(jwks.keys.length, 1);
-    assert.equal(jwks.keys[0].kty, 'oct');
-    assert.equal(jwks.keys[0].alg, 'HS256');
+    assert.equal(jwks.keys[0].kty, 'RSA');
+    assert.equal(jwks.keys[0].alg, 'RS256');
+    assert.ok(typeof (jwks.keys[0] as Record<string, unknown>).n === 'string');
+    assert.ok(typeof (jwks.keys[0] as Record<string, unknown>).e === 'string');
   });
 });
