@@ -1,0 +1,92 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/mcp-server.json",
+  "name": "aeitron",
+  "displayName": "Aeitron Cloud & Edge Infrastructure",
+  "version": "1.0.0",
+  "description": "Natural language control for Aeitron's intelligent edge network, DNS routing, and workload placement.",
+  "publisher": {
+    "name": "Aeitron Inc.",
+    "website": "https://aeitron.com",
+    "support": "https://aeitron.com/support"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aeitron/mcp-server"
+  },
+  "homepage": "https://aeitron.com/mcp",
+  "privacyPolicyUrl": "https://aeitron.com/privacy",
+  "termsOfServiceUrl": "https://aeitron.com/terms",
+  "icons": {
+    "svg": "https://assets.aeitron.com/brand/icon.svg",
+    "png": "https://assets.aeitron.com/brand/icon-128.png"
+  },
+  "transport": {
+    "stdio": {
+      "command": "node",
+      "args": ["dist/cli.js"]
+    },
+    "sse": {
+      "endpoint": "https://api.aeitron.com/mcp/sse",
+      "messagesEndpoint": "https://api.aeitron.com/mcp/messages"
+    }
+  },
+  "authentication": {
+    "type": "oauth2",
+    "oauthMetadata": "https://api.aeitron.com/.well-known/oauth-authorization-server",
+    "authorizationUrl": "https://console.aeitron.com/oauth/authorize",
+    "tokenUrl": "https://api.aeitron.com/v1/auth/token",
+    "scopes": [
+      "account:read",
+      "projects:read",
+      "projects:write",
+      "dns:read",
+      "dns:write",
+      "dns:write:delete",
+      "usage:read"
+    ]
+  },
+  "tools": [
+    {
+      "name": "get_account",
+      "description": "Retrieve user profile, organization, subscription tier, and resource quota limits.",
+      "scope": "account:read"
+    },
+    {
+      "name": "list_projects",
+      "description": "List all projects accessible to the tenant with pagination support.",
+      "scope": "projects:read"
+    },
+    {
+      "name": "get_project",
+      "description": "Retrieve detailed deployment health, attached custom domains, and edge telemetry for a specific project.",
+      "scope": "projects:read"
+    },
+    {
+      "name": "get_dns_records",
+      "description": "Fetch active DNS records for an authorized domain zone.",
+      "scope": "dns:read"
+    },
+    {
+      "name": "get_usage",
+      "description": "Summarize bandwidth, request counts, compute hours, and financial totals.",
+      "scope": "usage:read"
+    },
+    {
+      "name": "create_project",
+      "description": "Provision a new project workspace on the Aeitron edge.",
+      "scope": "projects:write"
+    },
+    {
+      "name": "create_dns_record",
+      "description": "Add a new DNS record to an authorized domain zone.",
+      "scope": "dns:write"
+    },
+    {
+      "name": "delete_dns_record",
+      "description": "Permanently delete a DNS record from the domain zone (Requires explicit safety confirmation).",
+      "scope": "dns:write:delete"
+    }
+  ]
+}
+

@@ -1,0 +1,315 @@
+openapi: 3.1.0
+info:
+  title: Aeitron Infrastructure MCP & Control API
+  description: >
+    Official Model Context Protocol & Infrastructure API integration for OpenAI ChatGPT and Claude.
+    Enables natural language querying of account limits, projects, edge domains, DNS records, and real-time usage.
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  contact:
+    name: Aeitron Developer Support
+    url: https://aeitron.com/support
+    email: support@aeitron.com
+servers:
+  - url: https://api.aeitron.com
+    description: Production Global Edge Gateway
+  - url: https://staging-api.aeitron.com
+    description: Staging Environment Edge Gateway
+security:
+  - OAuth2: []
+  - ApiKeyAuth: []
+paths:
+  /health:
+    get:
+      summary: Service Health Check
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Service is healthy and accepting connections.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "ok" }
+                  service: { type: string, example: "aeitron-mcp-server" }
+                  activeSessions: { type: integer, example: 3 }
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /ready:
+    get:
+      summary: Service Readiness Probe
+      operationId: getReady
+      security: []
+      responses:
+        '200':
+          description: MCP server is ready for tool dispatch.
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /.well-known/oauth-authorization-server:
+    get:
+      summary: RFC 8414 OAuth 2.0 Authorization Server Discovery
+      operationId: getOAuthMetadata
+      security: []
+      responses:
+        '200':
+          description: OAuth 2.0 discovery metadata.
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/account:
+    get:
+      summary: Retrieve authenticated account and quota limits
+      operationId: getAccount
+      security:
+        - OAuth2: [account:read]
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Account profile and quota limits.
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Insufficient permissions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/projects:
+    get:
+      summary: List accessible projects
+      operationId: listProjects
+      security:
+        - OAuth2: [projects:read]
+        - ApiKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: Project inventory.
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    post:
+      summary: Create a new project workspace
+      operationId: createProject
+      security:
+        - OAuth2: [projects:write]
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, region]
+              properties:
+                name: { type: string }
+                region: { type: string, enum: [global-anycast, sin1, fra1, iad1, dac1] }
+                framework: { type: string }
+      responses:
+        '201':
+          description: Project created successfully.
+        '400':
+          description: Invalid request parameters.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/projects/{projectId}:
+    get:
+      summary: Retrieve detailed project deployment status
+      operationId: getProject
+      security:
+        - OAuth2: [projects:read]
+        - ApiKeyAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Project telemetry and attached domains.
+        '404':
+          description: Project not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/domains/{domain}/records:
+    get:
+      summary: List active DNS records for domain zone
+      operationId: getDnsRecords
+      security:
+        - OAuth2: [dns:read]
+        - ApiKeyAuth: []
+      parameters:
+        - name: domain
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Active DNS zone records.
+        '404':
+          description: Domain zone not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    post:
+      summary: Create a new DNS record
+      operationId: createDnsRecord
+      security:
+        - OAuth2: [dns:write]
+        - ApiKeyAuth: []
+      parameters:
+        - name: domain
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, name, value]
+              properties:
+                type: { type: string, enum: [A, AAAA, CNAME, TXT, MX] }
+                name: { type: string }
+                value: { type: string }
+                ttl: { type: integer, default: 300 }
+                proxied: { type: boolean, default: true }
+      responses:
+        '201':
+          description: DNS record created.
+        '400':
+          description: Invalid record data.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/domains/{domain}/records/{recordId}:
+    delete:
+      summary: Delete a DNS record (Destructive Guarded)
+      operationId: deleteDnsRecord
+      security:
+        - OAuth2: [dns:write:delete]
+        - ApiKeyAuth: []
+      parameters:
+        - name: domain
+          in: path
+          required: true
+          schema: { type: string }
+        - name: recordId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: DNS record deleted.
+        '404':
+          description: Record not found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/usage:
+    get:
+      summary: Query infrastructure usage and billing metrics
+      operationId: getUsage
+      security:
+        - OAuth2: [usage:read]
+        - ApiKeyAuth: []
+      parameters:
+        - name: period
+          in: query
+          schema: { type: string, enum: [current, previous], default: current }
+      responses:
+        '200':
+          description: Bandwidth, request counts, and estimated costs.
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "Resource not found or unauthorized"
+        code:
+          type: string
+          example: "NOT_FOUND"
+
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      description: Aeitron OAuth 2.0 PKCE Flow
+      flows:
+        authorizationCode:
+          authorizationUrl: https://console.aeitron.com/oauth/authorize
+          tokenUrl: https://api.aeitron.com/v1/auth/token
+          scopes:
+            account:read: Read account and quota information
+            projects:read: View projects and deployments
+            projects:write: Create and provision new projects
+            dns:read: View DNS zones and records
+            dns:write: Add DNS records
+            dns:write:delete: Delete DNS records (Destructive)
+            usage:read: View metered resource consumption
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Bearer API Key authentication (e.g. "Bearer atk_live_...")

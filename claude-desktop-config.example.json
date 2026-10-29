@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "aeitron-infrastructure": {
+      "command": "node",
+      "args": [
+        "c:\\Users\\mah54\\Desktop\\Infrastructure Business\\apps\\mcp-server\\dist\\cli.js"
+      ],
+      "env": {
+        "AEITRON_API_BASE_URL": "http://localhost:8080",
+        "AEITRON_API_KEY": "atk_sandbox_dev_default_key",
+        "AEITRON_ENV": "development"
+      }
+    }
+  }
+}
+
