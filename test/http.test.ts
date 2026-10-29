@@ -1,6 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMcpHttpServer, McpHttpServerInstance } from '../src/http.js';
+import { createSignedTestJwt } from '../src/auth.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -487,6 +488,186 @@ describe('Remote Streamable HTTP & SSE Transport Suite (Phase 2)', () => {
       assert.equal(followUpRes.status, 404);
     } finally {
       await idleServer.close();
+    }
+  });
+
+  it('20. Legacy SSE Security: rejects message post without authorization token with 401', async () => {
+    // 1. Establish SSE session with valid token
+    const sseRes = await fetch(`${baseUrl}/mcp/sse`, {
+      headers: { 'Authorization': 'Bearer atk_sandbox_live_e2e_test' }
+    });
+    assert.equal(sseRes.status, 200);
+
+    // Read initial endpoint event to extract sessionId
+    const reader = sseRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let endpointData = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      endpointData += decoder.decode(value, { stream: true });
+      if (endpointData.includes('event: endpoint')) break;
+    }
+    const match = endpointData.match(/sessionId=([a-f0-9\-]+)/);
+    assert.ok(match, 'Expected sessionId in SSE endpoint event');
+    const sessionId = match[1];
+
+    // Attempt to post message without Authorization token -> must return 401
+    const postRes = await fetch(`${baseUrl}/mcp/messages?sessionId=${sessionId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
+    });
+    assert.equal(postRes.status, 401);
+    const body = await postRes.json() as { type: string; status: number };
+    assert.equal(body.status, 401);
+
+    reader.cancel().catch(() => {});
+  });
+
+  it('21. Legacy SSE Security: rejects invalid token with 401 Unauthorized', async () => {
+    const sseRes = await fetch(`${baseUrl}/mcp/sse`, {
+      headers: { 'Authorization': 'Bearer atk_sandbox_live_e2e_test' }
+    });
+    assert.equal(sseRes.status, 200);
+
+    const reader = sseRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let endpointData = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      endpointData += decoder.decode(value, { stream: true });
+      if (endpointData.includes('event: endpoint')) break;
+    }
+    const match = endpointData.match(/sessionId=([a-f0-9\-]+)/);
+    assert.ok(match);
+    const sessionId = match[1];
+
+    const postRes = await fetch(`${baseUrl}/mcp/messages?sessionId=${sessionId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer invalid_forged_token_xyz'
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
+    });
+    assert.equal(postRes.status, 401);
+
+    reader.cancel().catch(() => {});
+  });
+
+  it('22. Legacy SSE Security: rejects cross-tenant token on active SSE session with 403 Forbidden', async () => {
+    // Session owner has tenant_test_workspace
+    const sseRes = await fetch(`${baseUrl}/mcp/sse`, {
+      headers: { 'Authorization': 'Bearer atk_sandbox_live_e2e_test' }
+    });
+    assert.equal(sseRes.status, 200);
+
+    const reader = sseRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let endpointData = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      endpointData += decoder.decode(value, { stream: true });
+      if (endpointData.includes('event: endpoint')) break;
+    }
+    const match = endpointData.match(/sessionId=([a-f0-9\-]+)/);
+    assert.ok(match);
+    const sessionId = match[1];
+
+    // Attacker token from a different tenant
+    const attackerToken = createSignedTestJwt({
+      tenant_id: 'tenant_malicious_competitor',
+      sub: 'usr_attacker_99',
+      scopes: ['account:read', 'dns:read']
+    });
+
+    const postRes = await fetch(`${baseUrl}/mcp/messages?sessionId=${sessionId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${attackerToken}`
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
+    });
+    assert.equal(postRes.status, 403);
+    const body = await postRes.json() as { type: string; status: number };
+    assert.equal(body.status, 403);
+
+    reader.cancel().catch(() => {});
+  });
+
+  it('23. Legacy SSE Security: rejects same-tenant different actor token on active SSE session with 403 Forbidden', async () => {
+    const sseRes = await fetch(`${baseUrl}/mcp/sse`, {
+      headers: { 'Authorization': 'Bearer atk_sandbox_live_e2e_test' }
+    });
+    assert.equal(sseRes.status, 200);
+
+    const reader = sseRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let endpointData = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      endpointData += decoder.decode(value, { stream: true });
+      if (endpointData.includes('event: endpoint')) break;
+    }
+    const match = endpointData.match(/sessionId=([a-f0-9\-]+)/);
+    assert.ok(match);
+    const sessionId = match[1];
+
+    // Same tenant ('tenant_test_workspace'), but DIFFERENT actor ('usr_different_colleague')
+    const differentActorToken = createSignedTestJwt({
+      tenant_id: 'tenant_test_workspace',
+      sub: 'usr_different_colleague',
+      scopes: ['account:read', 'dns:read']
+    });
+
+    const postRes = await fetch(`${baseUrl}/mcp/messages?sessionId=${sessionId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${differentActorToken}`
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
+    });
+    assert.equal(postRes.status, 403);
+
+    reader.cancel().catch(() => {});
+  });
+
+  it('24. DNS Deletion Request Endpoints: strictly require operator scope and redact approvalToken', async () => {
+    // 1. Non-operator caller lacking dns:write:delete scope
+    const readOnlyToken = createSignedTestJwt({
+      tenant_id: 'tenant_test_workspace',
+      sub: 'usr_readonly_analyst',
+      scopes: ['account:read', 'dns:read']
+    });
+
+    const getForbidden = await fetch(`${baseUrl}/v1/dns/deletion-requests`, {
+      headers: { 'Authorization': `Bearer ${readOnlyToken}` }
+    });
+    assert.equal(getForbidden.status, 403);
+
+    // 2. Operator caller with dns:write:delete scope
+    const operatorToken = createSignedTestJwt({
+      tenant_id: 'tenant_test_workspace',
+      sub: 'usr_operator_admin',
+      scopes: ['dns:write:delete']
+    });
+
+    const getOk = await fetch(`${baseUrl}/v1/dns/deletion-requests`, {
+      headers: { 'Authorization': `Bearer ${operatorToken}` }
+    });
+    assert.equal(getOk.status, 200);
+    const data = await getOk.json() as { requests: Array<Record<string, unknown>> };
+    assert.ok(Array.isArray(data.requests));
+
+    // Verify redaction: approvalToken must NEVER be exposed in the list endpoint
+    for (const req of data.requests) {
+      assert.strictEqual(req['approvalToken'], undefined, 'approvalToken MUST NOT be present in read DTO');
     }
   });
 });

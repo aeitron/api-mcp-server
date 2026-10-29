@@ -8,7 +8,7 @@ This service serves as a secure, sandboxed integration layer bridging LLM client
 
 ## Capabilities & Tools
 
-[![Aeitron MCP Server CI](https://github.com/aeitron/mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/aeitron/mcp-server/actions/workflows/ci.yml)
+[![Aeitron MCP Server CI](https://github.com/aeitron/api-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/aeitron/api-mcp-server/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 The MCP server exposes strictly-typed, schema-validated tools governed by server-side authorization:
@@ -49,7 +49,7 @@ To connect Claude Desktop to your Aeitron Infrastructure platform, configure `cl
   "mcpServers": {
     "aeitron": {
       "command": "node",
-      "args": ["/path/to/aeitron/apps/mcp-server/dist/cli.js"],
+      "args": ["/path/to/aeitron/apps/mcp-server/dist/src/cli.js"],
       "env": {
         "AEITRON_API_BASE_URL": "https://api.aeitron.com",
         "AEITRON_API_KEY": "your_authoritative_aeitron_api_key_here"
@@ -65,7 +65,7 @@ To connect Claude Desktop to your Aeitron Infrastructure platform, configure `cl
   "mcpServers": {
     "aeitron": {
       "command": "node",
-      "args": ["C:\\path\\to\\aeitron\\apps\\mcp-server\\dist\\cli.js"],
+      "args": ["C:\\path\\to\\aeitron\\apps\\mcp-server\\dist\\src\\cli.js"],
       "env": {
         "AEITRON_API_BASE_URL": "https://api.aeitron.com",
         "AEITRON_API_KEY": "your_authoritative_aeitron_api_key_here"
@@ -106,6 +106,6 @@ npm install
 # Compile TypeScript
 npm run build
 
-# Run complete verification test suite (47 tests across 4 test suites)
+# Run complete verification test suite (78 tests across 5 test suites)
 npm test
 ```

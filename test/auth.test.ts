@@ -16,6 +16,10 @@ import {
   loadAuthoritativeKeysFromEnv,
   issueDnsDeletionChallenge,
   verifyDnsDeletionChallenge,
+  verifyRsaKeyPairMatch,
+  createDnsDeletionRequest,
+  authorizeDnsDeletionRequest,
+  createAuthorizedDnsDeletionToken,
   ACTIVE_KID
 } from '../src/auth.js';
 
@@ -413,5 +417,123 @@ describe('OAuth & Cryptographic Token Verification Suite', () => {
     // Verify token validity
     const verified = verifyAuthToken(token);
     assert.equal(verified.success, true);
+  });
+
+  it('verifyRsaKeyPairMatch: accurately validates correspondence between private and public keys', () => {
+    const pair1 = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+    const pair2 = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+
+    assert.equal(verifyRsaKeyPairMatch(pair1.privateKey, pair1.publicKey), true);
+    assert.equal(verifyRsaKeyPairMatch(pair2.privateKey, pair2.publicKey), true);
+    assert.equal(verifyRsaKeyPairMatch(pair1.privateKey, pair2.publicKey), false);
+    assert.equal(verifyRsaKeyPairMatch(pair2.privateKey, pair1.publicKey), false);
+    assert.equal(verifyRsaKeyPairMatch('invalid_key', pair1.publicKey), false);
+  });
+
+  it('DNS deletion approval hardening: strictly rejects challenge tokens missing mandatory requestId', () => {
+    // Generate forged token payload lacking requestId
+    const payload = JSON.stringify({
+      action: 'dns_delete_challenge',
+      tenantId: 'tenant_acme',
+      domain: 'aeitron.com',
+      recordId: 'rec_01',
+      nonce: '12345678',
+      expiresAt: Date.now() + 60000
+    });
+    const payloadB64 = Buffer.from(payload).toString('base64url');
+    const sig = crypto.createHmac('sha256', 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890')
+      .update(`del:${payloadB64}`)
+      .digest('base64url');
+    const tokenWithoutRequestId = `del_tok_${payloadB64}.${sig}`;
+
+    const res = verifyDnsDeletionChallenge(tokenWithoutRequestId, 'tenant_acme', 'aeitron.com', 'rec_01');
+    assert.equal(res.valid, false);
+    assert.ok(res.error?.includes('requestId'));
+  });
+
+  it('DNS deletion approval hardening: strictly rejects challenge tokens referencing nonexistent request', () => {
+    const payload = JSON.stringify({
+      action: 'dns_delete_challenge',
+      requestId: 'del_req_nonexistent_fake_id_1234',
+      tenantId: 'tenant_acme',
+      domain: 'aeitron.com',
+      recordId: 'rec_01',
+      nonce: '12345678',
+      expiresAt: Date.now() + 60000
+    });
+    const payloadB64 = Buffer.from(payload).toString('base64url');
+    const sig = crypto.createHmac('sha256', 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890')
+      .update(`del:${payloadB64}`)
+      .digest('base64url');
+    const token = `del_tok_${payloadB64}.${sig}`;
+
+    const res = verifyDnsDeletionChallenge(token, 'tenant_acme', 'aeitron.com', 'rec_01');
+    assert.equal(res.valid, false);
+    assert.ok(res.error?.includes('not found'));
+  });
+
+  it('DNS deletion approval hardening: strictly rejects challenge tokens referencing unauthorized request', () => {
+    // 1. Create a request but DO NOT authorize it
+    const req = createDnsDeletionRequest('tenant_acme', 'usr_requester', 'aeitron.com', 'rec_unauthorized_99');
+
+    // Craft token with this requestId before operator authorization
+    const payload = JSON.stringify({
+      action: 'dns_delete_challenge',
+      requestId: req.requestId,
+      tenantId: 'tenant_acme',
+      domain: 'aeitron.com',
+      recordId: 'rec_unauthorized_99',
+      nonce: '12345678',
+      expiresAt: Date.now() + 60000
+    });
+    const payloadB64 = Buffer.from(payload).toString('base64url');
+    const sig = crypto.createHmac('sha256', 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890')
+      .update(`del:${payloadB64}`)
+      .digest('base64url');
+    const token = `del_tok_${payloadB64}.${sig}`;
+
+    const res = verifyDnsDeletionChallenge(token, 'tenant_acme', 'aeitron.com', 'rec_unauthorized_99');
+    assert.equal(res.valid, false);
+    assert.ok(res.error?.includes('not been authorized'));
+  });
+
+  it('DNS deletion approval hardening: strictly rejects challenge tokens with mismatched approvalToken', () => {
+    const req = createDnsDeletionRequest('tenant_acme', 'usr_requester', 'aeitron.com', 'rec_mismatch_88');
+    const authRes = authorizeDnsDeletionRequest({
+      actorId: 'usr_operator',
+      tenantId: 'tenant_acme',
+      tier: 'enterprise',
+      scopes: ['dns:write:delete'],
+      livemode: false
+    }, req.requestId);
+    assert.equal(authRes.success, true);
+
+    // Craft a DIFFERENT validly-signed token referencing the same requestId
+    const payload = JSON.stringify({
+      action: 'dns_delete_challenge',
+      requestId: req.requestId,
+      tenantId: 'tenant_acme',
+      domain: 'aeitron.com',
+      recordId: 'rec_mismatch_88',
+      nonce: 'different_nonce_888',
+      expiresAt: Date.now() + 60000
+    });
+    const payloadB64 = Buffer.from(payload).toString('base64url');
+    const sig = crypto.createHmac('sha256', 'aeitron_dev_jwt_secret_do_not_use_in_prod_1234567890')
+      .update(`del:${payloadB64}`)
+      .digest('base64url');
+    const differentToken = `del_tok_${payloadB64}.${sig}`;
+
+    const res = verifyDnsDeletionChallenge(differentToken, 'tenant_acme', 'aeitron.com', 'rec_mismatch_88');
+    assert.equal(res.valid, false);
+    assert.ok(res.error?.includes('does not match authorized token'));
   });
 });

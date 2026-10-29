@@ -75,9 +75,14 @@ export const ACTIVE_KID = process.env.AEITRON_JWT_KID || 'aeitron-mcp-rsa-2026-v
 const AUTHORITATIVE_KEYS = new Map<string, RegisteredKey>();
 const OAUTH_CLIENTS = new Map<string, OAuthClient>();
 
+function isProduction(): boolean {
+  const env = (process.env.AEITRON_ENV || process.env.NODE_ENV || '').trim().toLowerCase();
+  return env === 'production' || env === 'prod';
+}
+
 function getStorageDir(): string {
   const config = getConfig();
-  const configured = (config.storageDir || process.env.AEITRON_STORAGE_DIR || '').trim();
+  const configured = (config.storageDir || process.env.AEITRON_STORAGE_DIR || process.env.AEITRON_STATE_DIR || '').trim();
   if (configured) {
     return configured;
   }
@@ -90,8 +95,10 @@ function ensureStorageDir(): string {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-  } catch {
-    // Fall through if file system is read-only or in constrained environment
+  } catch (err) {
+    if (isProduction()) {
+      throw new Error(`CRITICAL: Failed to initialize persistent storage directory '${dir}' in production: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   return dir;
 }
@@ -177,19 +184,54 @@ interface RegisteredPublicKey {
 
 const REGISTERED_PUBLIC_KEYS = new Map<string, RegisteredPublicKey>();
 
+export function verifyRsaKeyPairMatch(privateKeyPem: string, publicKeyPem: string): boolean {
+  try {
+    const privKey = crypto.createPrivateKey(privateKeyPem);
+    const derivedPub = crypto.createPublicKey(privKey);
+    const pubKey = crypto.createPublicKey(publicKeyPem);
+
+    const derivedDer = derivedPub.export({ type: 'spki', format: 'der' });
+    const pubDer = pubKey.export({ type: 'spki', format: 'der' });
+    return crypto.timingSafeEqual(derivedDer, pubDer);
+  } catch {
+    return false;
+  }
+}
+
 // Asymmetric Key Pair for RFC 7517 compliant JWKS public key distribution and RS256 signing
 function loadOrGenerateRsaKeyPair(): RsaKeyPair {
   // 1. Direct environment variable support (standard 12-factor / KMS / secret manager)
   const envPrivate = process.env.AEITRON_RSA_PRIVATE_KEY || process.env.AEITRON_JWT_PRIVATE_KEY;
   const envPublic = process.env.AEITRON_RSA_PUBLIC_KEY || process.env.AEITRON_JWT_PUBLIC_KEY;
 
-  if (envPrivate && envPublic) {
-    try {
-      crypto.createPrivateKey(envPrivate);
-      crypto.createPublicKey(envPublic);
-      return { privateKey: envPrivate, publicKey: envPublic };
-    } catch {
-      // If environment keys are malformed, fall through
+  if (envPrivate) {
+    if (envPublic) {
+      if (!verifyRsaKeyPairMatch(envPrivate, envPublic)) {
+        if (isProduction()) {
+          throw new Error('CRITICAL CONFIGURATION ERROR: Supplied AEITRON_RSA_PUBLIC_KEY does not correspond to AEITRON_RSA_PRIVATE_KEY.');
+        }
+        process.stderr.write('[aeitron-mcp][WARN] AEITRON_RSA_PUBLIC_KEY does not correspond to AEITRON_RSA_PRIVATE_KEY. Deriving public key from private key.\n');
+        try {
+          const privKey = crypto.createPrivateKey(envPrivate);
+          const derivedPub = crypto.createPublicKey(privKey).export({ type: 'spki', format: 'pem' }) as string;
+          return { privateKey: envPrivate, publicKey: derivedPub };
+        } catch {
+          // Fall through
+        }
+      } else {
+        return { privateKey: envPrivate, publicKey: envPublic };
+      }
+    } else {
+      // Automatically derive corresponding public key from private key
+      try {
+        const privKey = crypto.createPrivateKey(envPrivate);
+        const derivedPub = crypto.createPublicKey(privKey).export({ type: 'spki', format: 'pem' }) as string;
+        return { privateKey: envPrivate, publicKey: derivedPub };
+      } catch (err) {
+        if (isProduction()) {
+          throw new Error(`CRITICAL: Malformed AEITRON_RSA_PRIVATE_KEY in production: ${String(err)}`);
+        }
+      }
     }
   }
 
@@ -200,12 +242,18 @@ function loadOrGenerateRsaKeyPair(): RsaKeyPair {
       const fileContent = fs.readFileSync(keyFilePath, 'utf-8');
       const parsed = JSON.parse(fileContent);
       if (parsed.privateKey && parsed.publicKey) {
-        crypto.createPrivateKey(parsed.privateKey);
-        crypto.createPublicKey(parsed.publicKey);
-        return { privateKey: parsed.privateKey, publicKey: parsed.publicKey };
+        if (!verifyRsaKeyPairMatch(parsed.privateKey, parsed.publicKey)) {
+          if (isProduction()) {
+            throw new Error(`CRITICAL CONFIGURATION ERROR: Key pair in '${keyFilePath}' does not match.`);
+          }
+        } else {
+          return { privateKey: parsed.privateKey, publicKey: parsed.publicKey };
+        }
       }
-    } catch {
-      // Fall through
+    } catch (err) {
+      if (isProduction()) {
+        throw new Error(`CRITICAL: Failed to load RSA key file '${keyFilePath}' in production: ${String(err)}`);
+      }
     }
   }
 
@@ -217,13 +265,13 @@ function loadOrGenerateRsaKeyPair(): RsaKeyPair {
       const cachedContent = fs.readFileSync(cachedKeyFile, 'utf-8');
       const cached = JSON.parse(cachedContent);
       if (cached.privateKey && cached.publicKey) {
-        crypto.createPrivateKey(cached.privateKey);
-        crypto.createPublicKey(cached.publicKey);
-        return { privateKey: cached.privateKey, publicKey: cached.publicKey };
+        if (verifyRsaKeyPairMatch(cached.privateKey, cached.publicKey)) {
+          return { privateKey: cached.privateKey, publicKey: cached.publicKey };
+        }
       }
     }
   } catch {
-    // Fall through
+    // Corrupt cache file, fall through
   }
 
   // 4. Generate new RSA-2048 key pair
@@ -233,15 +281,19 @@ function loadOrGenerateRsaKeyPair(): RsaKeyPair {
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
   });
 
-  // Persist generated key pair to local storage cache if writable
+  // Persist generated key pair to local storage cache atomically
   try {
+    const tempFile = `${cachedKeyFile}.tmp.${Date.now()}`;
     fs.writeFileSync(
-      cachedKeyFile,
+      tempFile,
       JSON.stringify({ privateKey: generated.privateKey, publicKey: generated.publicKey, generatedAt: Date.now() }, null, 2),
       { encoding: 'utf-8', mode: 0o600 }
     );
-  } catch {
-    // Ignore write error if storage is non-writable
+    fs.renameSync(tempFile, cachedKeyFile);
+  } catch (err) {
+    if (isProduction()) {
+      throw new Error(`CRITICAL: Failed to persist generated RSA key pair to '${cachedKeyFile}' in production: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   return generated;
@@ -361,15 +413,23 @@ function saveDnsStateToDisk(): void {
   const { reqFile, consumedFile } = getDnsStateFiles();
   try {
     const reqList = Array.from(PENDING_DELETION_REQUESTS.values());
-    fs.writeFileSync(reqFile, JSON.stringify(reqList, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  } catch {
-    // Ignore write errors
+    const tempReqFile = `${reqFile}.tmp.${Date.now()}`;
+    fs.writeFileSync(tempReqFile, JSON.stringify(reqList, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(tempReqFile, reqFile);
+  } catch (err) {
+    if (isProduction()) {
+      throw new Error(`CRITICAL: Failed to persist DNS deletion requests to '${reqFile}' in production: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   try {
     const consumedList = Array.from(CONSUMED_APPROVAL_TOKENS);
-    fs.writeFileSync(consumedFile, JSON.stringify(consumedList, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  } catch {
-    // Ignore write errors
+    const tempConsumedFile = `${consumedFile}.tmp.${Date.now()}`;
+    fs.writeFileSync(tempConsumedFile, JSON.stringify(consumedList, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(tempConsumedFile, consumedFile);
+  } catch (err) {
+    if (isProduction()) {
+      throw new Error(`CRITICAL: Failed to persist consumed approval tokens to '${consumedFile}' in production: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 
@@ -998,9 +1058,12 @@ export function createAuthorizedDnsDeletionToken(
   tenantId: string,
   domain: string,
   recordId: string,
-  requestId?: string,
+  requestId: string,
   secret?: string
-): { token: string; expiresAt: number; requestId?: string } {
+): { token: string; expiresAt: number; requestId: string } {
+  if (!requestId) {
+    throw new Error('Mandatory requestId required to issue an authorized deletion challenge token.');
+  }
   const config = getConfig();
   const signingSecret = secret || config.jwtSecret;
   const expiresAt = Date.now() + 5 * 60 * 1000;
@@ -1029,17 +1092,38 @@ export function createAuthorizedDnsDeletionToken(
   };
 }
 
-// Backwards-compatible alias for existing tests
-export const issueDnsDeletionChallenge = (
+// Backwards-compatible alias for existing tests: registers a pending deletion request and authorizes it
+export function issueDnsDeletionChallenge(
   tenantId: string,
   domain: string,
   recordId: string,
   secret?: string
-) => createAuthorizedDnsDeletionToken(tenantId, domain, recordId, undefined, secret);
+): { token: string; expiresAt: number; requestId: string } {
+  const req = createDnsDeletionRequest(tenantId, 'operator_test_runner', domain, recordId);
+  const authorized = authorizeDnsDeletionRequest(
+    {
+      actorId: 'operator_test_runner',
+      tenantId,
+      tier: 'enterprise',
+      scopes: ['dns:write:delete'],
+      livemode: false
+    },
+    req.requestId,
+    secret
+  );
+  if (!authorized.success) {
+    throw new Error(`Failed to issue challenge token: ${authorized.error}`);
+  }
+  return {
+    token: authorized.token,
+    expiresAt: authorized.expiresAt,
+    requestId: authorized.requestId
+  };
+}
 
 /**
  * Verifies and atomically consumes a DNS deletion approval challenge token.
- * Enforces single-use replay protection.
+ * Enforces single-use replay protection and strict request binding.
  */
 export function verifyAndConsumeDnsDeletionApproval(
   challengeToken: string,
@@ -1095,17 +1179,61 @@ export function verifyAndConsumeDnsDeletionApproval(
       return { valid: false, error: 'Challenge approval token tenant mismatch.' };
     }
 
-    // If bound to a specific request ID, atomically mark that request as consumed
-    if (payload.requestId) {
-      const req = PENDING_DELETION_REQUESTS.get(payload.requestId);
-      if (req) {
-        if (req.consumed) {
-          return { valid: false, error: 'Approval token request has already been consumed (replay attempt detected).' };
-        }
-        req.consumed = true;
-        req.consumedAt = Date.now();
-      }
+    // MANDATORY REQUEST ID ENFORCEMENT & DURABLE BINDING
+    if (!payload.requestId) {
+      return {
+        valid: false,
+        error: 'Security Error: Approval token is missing mandatory requestId. Human operator authorization required.'
+      };
     }
+
+    const req = PENDING_DELETION_REQUESTS.get(payload.requestId);
+    if (!req) {
+      return {
+        valid: false,
+        error: `Referenced deletion request '${payload.requestId}' was not found or has expired.`
+      };
+    }
+    if (!req.authorized) {
+      return {
+        valid: false,
+        error: `Referenced deletion request '${payload.requestId}' has not been authorized by an operator.`
+      };
+    }
+    if (req.consumed) {
+      return {
+        valid: false,
+        error: `Referenced deletion request '${payload.requestId}' has already been consumed (replay attempt detected).`
+      };
+    }
+    if (Date.now() > req.expiresAt) {
+      return {
+        valid: false,
+        error: `Referenced deletion request '${payload.requestId}' has expired.`
+      };
+    }
+    if (req.approvalToken && req.approvalToken !== challengeToken) {
+      return {
+        valid: false,
+        error: 'Challenge approval token does not match authorized token issued for this request.'
+      };
+    }
+    if (req.domain !== expectedDomain || req.recordId !== expectedRecordId) {
+      return {
+        valid: false,
+        error: 'Referenced deletion request parameters do not match target domain or record ID.'
+      };
+    }
+    if (expectedTenantId !== 'anonymous' && req.tenantId !== expectedTenantId) {
+      return {
+        valid: false,
+        error: 'Referenced deletion request tenant does not match caller tenant.'
+      };
+    }
+
+    // Atomically mark request as consumed
+    req.consumed = true;
+    req.consumedAt = Date.now();
 
     // Atomically consume token to prevent replay
     CONSUMED_APPROVAL_TOKENS.add(tokenHash);
@@ -1258,4 +1386,45 @@ export function getJwksMetadata(): { keys: Array<Record<string, unknown>> } {
     });
   }
   return { keys };
+}
+
+/**
+ * Public, safe DTO for DNS deletion requests.
+ * Explicitly redacts approvalToken so sensitive tokens are NEVER leaked via read endpoints.
+ */
+export interface DnsDeletionRequestDto {
+  requestId: string;
+  tenantId: string;
+  actorId: string;
+  domain: string;
+  recordId: string;
+  createdAt: number;
+  expiresAt: number;
+  authorized: boolean;
+  authorizedBy?: string;
+  authorizedAt?: number;
+  consumed: boolean;
+  consumedAt?: number;
+}
+
+export function toRedactedDnsRequestDto(req: PendingDeletionRequest): DnsDeletionRequestDto {
+  return {
+    requestId: req.requestId,
+    tenantId: req.tenantId,
+    actorId: req.actorId,
+    domain: req.domain,
+    recordId: req.recordId,
+    createdAt: req.createdAt,
+    expiresAt: req.expiresAt,
+    authorized: req.authorized,
+    authorizedBy: req.authorizedBy,
+    authorizedAt: req.authorizedAt,
+    consumed: req.consumed || false,
+    consumedAt: req.consumedAt
+  };
+}
+
+export function resetDnsStateForTesting(): void {
+  PENDING_DELETION_REQUESTS.clear();
+  CONSUMED_APPROVAL_TOKENS.clear();
 }

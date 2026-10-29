@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aeitron/mcp-server.git"
+    "url": "https://github.com/aeitron/api-mcp-server.git"
   },
   "type": "module",
   "main": "dist/src/index.js",

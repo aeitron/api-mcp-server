@@ -24,7 +24,8 @@ import {
   registerOAuthClientForTesting,
   authorizeDnsDeletionRequest,
   getPendingDnsDeletionRequest,
-  listPendingDnsDeletionRequests
+  listPendingDnsDeletionRequests,
+  toRedactedDnsRequestDto
 } from './auth.js';
 import { getConfig, McpServerConfig } from './config.js';
 import { ToolContext } from './types.js';
@@ -36,6 +37,7 @@ interface ActiveSession {
   serverInstance: ReturnType<typeof createAeitronMcpServer>;
   context: ToolContext;
   createdAt: Date;
+  lastActiveAt: number;
 }
 
 export interface McpHttpServerInstance {
@@ -261,7 +263,7 @@ export function createMcpHttpServer(
   app.post('/v1/dns/approve-deletion', dnsApprovalHandler);
   app.post('/mcp/dns/approve-deletion', dnsApprovalHandler);
 
-  // List pending DNS deletion requests awaiting approval
+  // List pending DNS deletion requests awaiting approval (Redacted DTO, strictly omits approvalToken)
   app.get('/v1/dns/deletion-requests', (c: any) => {
     const host = c.req.header('host') || 'localhost';
     const parsedUrl = new URL(c.req.url, `http://${host}`);
@@ -277,11 +279,22 @@ export function createMcpHttpServer(
       return c.json({ error: 'unauthorized', error_description: auth.error }, auth.status);
     }
 
-    const requests = listPendingDnsDeletionRequests(auth.claims.tenantId);
+    // Privileged operator scope enforcement
+    const hasOperatorScope = auth.claims.scopes.includes('dns:write:delete') ||
+      auth.claims.scopes.includes('dns:write') ||
+      auth.claims.scopes.includes('*');
+    if (!hasOperatorScope) {
+      return c.json({
+        error: 'forbidden',
+        error_description: 'Access denied: Viewing pending DNS deletion requests requires operator scope "dns:write:delete" or "dns:write".'
+      }, 403);
+    }
+
+    const requests = listPendingDnsDeletionRequests(auth.claims.tenantId).map(toRedactedDnsRequestDto);
     return c.json({ requests });
   });
 
-  // Get specific DNS deletion request details
+  // Get specific DNS deletion request details (Redacted DTO, strictly omits approvalToken)
   app.get('/v1/dns/deletion-requests/:id', (c: any) => {
     const host = c.req.header('host') || 'localhost';
     const parsedUrl = new URL(c.req.url, `http://${host}`);
@@ -297,13 +310,24 @@ export function createMcpHttpServer(
       return c.json({ error: 'unauthorized', error_description: auth.error }, auth.status);
     }
 
+    // Privileged operator scope enforcement
+    const hasOperatorScope = auth.claims.scopes.includes('dns:write:delete') ||
+      auth.claims.scopes.includes('dns:write') ||
+      auth.claims.scopes.includes('*');
+    if (!hasOperatorScope) {
+      return c.json({
+        error: 'forbidden',
+        error_description: 'Access denied: Viewing pending DNS deletion requests requires operator scope "dns:write:delete" or "dns:write".'
+      }, 403);
+    }
+
     const reqId = c.req.param('id');
     const request = getPendingDnsDeletionRequest(reqId);
     if (!request || (auth.claims.tenantId !== 'anonymous' && request.tenantId !== auth.claims.tenantId)) {
       return c.json({ error: 'not_found', error_description: 'Deletion request not found or expired.' }, 404);
     }
 
-    return c.json({ request });
+    return c.json({ request: toRedactedDnsRequestDto(request) });
   });
 
   // 6. Welcome & Discovery
@@ -594,7 +618,8 @@ export function createMcpHttpServer(
         authClaims: auth.claims
       });
 
-      const messagesPath = pathname === '/sse' ? '/messages' : '/mcp/messages';
+      const baseMessagesPath = pathname === '/sse' ? '/messages' : '/mcp/messages';
+      const messagesPath = wasInQuery && rawToken ? `${baseMessagesPath}?token=${encodeURIComponent(rawToken)}` : baseMessagesPath;
       const transport = new SSEServerTransport(messagesPath, res);
 
       const session: ActiveSession = {
@@ -602,7 +627,8 @@ export function createMcpHttpServer(
         transport,
         serverInstance,
         context: toolContext,
-        createdAt: new Date()
+        createdAt: new Date(),
+        lastActiveAt: Date.now()
       };
 
       activeSessions.set(transport.sessionId, session);
@@ -650,25 +676,55 @@ export function createMcpHttpServer(
         return;
       }
 
-      // Security Check: Cross-Tenant Session Binding on SSE Messages
+      // Security Check: Strict Authentication & Identity Binding on SSE Messages
       const { token: rawToken } = extractTokenFromRequest(req, parsedUrl);
-      if (rawToken) {
-        const auth = verifyAuthToken(rawToken, {
-          isProduction: config.environment === 'production',
-          allowSandbox: config.allowSandbox,
-          jwtSecret: config.jwtSecret
+      if (!rawToken) {
+        res.writeHead(401, {
+          'Content-Type': 'application/problem+json',
+          'WWW-Authenticate': 'Bearer realm="Aeitron MCP"'
         });
-        if (auth.success && (auth.claims.tenantId !== session.context.tenantId || auth.claims.actorId !== session.context.actorId)) {
-          res.writeHead(403, { 'Content-Type': 'application/problem+json' });
-          res.end(JSON.stringify({
-            type: 'https://aeitron.com/errors/forbidden',
-            title: 'Forbidden',
-            status: 403,
-            detail: 'Cross-tenant session access prohibited. Caller identity does not match SSE session owner.'
-          }));
-          return;
-        }
+        res.end(JSON.stringify({
+          type: 'https://aeitron.com/errors/unauthorized',
+          title: 'Unauthorized',
+          status: 401,
+          detail: 'Missing required Authorization bearer token on SSE message post.'
+        }));
+        return;
       }
+
+      const auth = verifyAuthToken(rawToken, {
+        isProduction: config.environment === 'production',
+        allowSandbox: config.allowSandbox,
+        jwtSecret: config.jwtSecret
+      });
+
+      if (!auth.success) {
+        res.writeHead(auth.status, {
+          'Content-Type': 'application/problem+json',
+          'WWW-Authenticate': 'Bearer realm="Aeitron MCP"'
+        });
+        res.end(JSON.stringify({
+          type: 'https://aeitron.com/errors/unauthorized',
+          title: auth.code,
+          status: auth.status,
+          detail: auth.error
+        }));
+        return;
+      }
+
+      if (auth.claims.tenantId !== session.context.tenantId || auth.claims.actorId !== session.context.actorId) {
+        res.writeHead(403, { 'Content-Type': 'application/problem+json' });
+        res.end(JSON.stringify({
+          type: 'https://aeitron.com/errors/forbidden',
+          title: 'Forbidden',
+          status: 403,
+          detail: 'Cross-tenant session access prohibited. Caller identity does not match SSE session owner.'
+        }));
+        return;
+      }
+
+      // Update session activity timestamp to prevent premature idle cleanup
+      session.lastActiveAt = Date.now();
 
       try {
         await session.transport.handlePostMessage(req, res);
@@ -698,7 +754,7 @@ export function createMcpHttpServer(
     }
 
     for (const [id, session] of activeSessions.entries()) {
-      if (now - session.createdAt.getTime() > config.sessionIdleTimeoutMs) {
+      if (now - session.lastActiveAt > config.sessionIdleTimeoutMs) {
         activeSessions.delete(id);
         session.transport.close().catch(() => {});
         session.serverInstance.server.close().catch(() => {});

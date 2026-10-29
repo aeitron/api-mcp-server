@@ -27,7 +27,7 @@ jobs:
       - name: Build TypeScript
         run: npm run build
 
-      - name: Run Complete Test Suite (47 passing tests)
+      - name: Run Complete Test Suite
         run: npm test
 
       - name: Verify OpenAPI Contract

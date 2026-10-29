@@ -93,7 +93,7 @@ export function getConfig(): McpServerConfig {
     allowSandbox,
     sessionIdleTimeoutMs: parseInt(process.env.AEITRON_SESSION_IDLE_TIMEOUT_MS || '1800000', 10), // 30 minutes default
     maxActiveSessions: parseInt(process.env.AEITRON_MAX_ACTIVE_SESSIONS || '100', 10),
-    storageDir: process.env.AEITRON_STORAGE_DIR || '',
+    storageDir: process.env.AEITRON_STORAGE_DIR || process.env.AEITRON_STATE_DIR || '',
     rawApiKeys: process.env.AEITRON_API_KEYS,
     rawOAuthClients: process.env.AEITRON_OAUTH_CLIENTS
   };
